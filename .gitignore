@@ -1,0 +1,64 @@
+# Operating system / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+.python
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Local data
+data/
+
+# Generated notebook outputs
+submission.csv
+submissions/
+output/
+outputs/
+reports/
+logs/
+*.log
+
+# Model artifacts
+models/
+checkpoints/
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.bst
+*.onnx
+
+# Large tabular / array artifacts
+*.parquet
+*.feather
+*.h5
+*.npy
+*.npz

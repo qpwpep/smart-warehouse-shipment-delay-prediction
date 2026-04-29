@@ -1,0 +1,23 @@
+* text=auto
+
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.python-version text eol=lf
+*.ipynb text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.csv text eol=lf
+
+*.pkl binary
+*.pickle binary
+*.joblib binary
+*.model binary
+*.bst binary
+*.onnx binary
+*.parquet binary
+*.feather binary
+*.h5 binary
+*.npy binary
+*.npz binary
