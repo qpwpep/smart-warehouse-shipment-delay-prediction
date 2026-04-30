@@ -1,0 +1,64 @@
+target: avg_delay_minutes_next_30m
+id_cols:
+  - ID
+  - layout_id
+  - scenario_id
+
+model_seed: 42
+
+cv:
+  n_splits: 5
+  seed: 42
+
+run:
+  date: ${now:%Y-%m-%d}
+
+data:
+  dir: data
+  train: train.csv
+  test: test.csv
+  layout: layout_info.csv
+  sample_submission: sample_submission.csv
+
+output:
+  dir: outputs/${run.date}
+  submission: submission.csv
+  oof: oof_train.csv
+  report: cv_report_train.json
+
+features:
+  lag_rolling_cols:
+    - order_inflow_15m
+    - congestion_score
+    - battery_mean
+    - low_battery_ratio
+    - robot_idle
+    - robot_charging
+    - charge_queue_length
+    - max_zone_density
+
+models:
+  families:
+    - lightgbm
+    - xgboost
+    - catboost
+
+objectives:
+  - name: mae
+    params:
+      lightgbm:
+        objective: mae
+        metric: mae
+      xgboost:
+        objective: reg:absoluteerror
+      catboost:
+        loss_function: MAE
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/hydra/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

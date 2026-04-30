@@ -7,10 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from catboost import CatBoostRegressor
+import hydra
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from xgboost import XGBRegressor
+from hydra.utils import to_absolute_path
 from lightgbm import LGBMRegressor
+from omegaconf import DictConfig, OmegaConf
 from pandas.api.types import CategoricalDtype
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
@@ -21,7 +26,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 TARGET = "avg_delay_minutes_next_30m"
 ID_COLS = ["ID", "layout_id", "scenario_id"]
-SEEDS = [42, 2026, 777]
+MODEL_SEED = 42
 N_SPLITS = 5
 CV_SEED = 42
 
@@ -48,13 +53,65 @@ LAG_ROLLING_COLS = [
     "max_zone_density",
 ]
 
+MODEL_FAMILIES = ["lightgbm", "xgboost", "catboost"]
+
 OBJECTIVES = [
-    {"name": "mae", "params": {"objective": "mae", "metric": "mae"}},
     {
-        "name": "quantile_median",
-        "params": {"objective": "quantile", "metric": "mae", "alpha": 0.5},
+        "name": "mae",
+        "params": {
+            "lightgbm": {"objective": "mae", "metric": "mae"},
+            "xgboost": {"objective": "reg:absoluteerror"},
+            "catboost": {"loss_function": "MAE"},
+        },
     },
 ]
+
+
+def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
+    global TARGET
+    global ID_COLS
+    global MODEL_SEED
+    global N_SPLITS
+    global CV_SEED
+    global DATA_DIR
+    global TRAIN_PATH
+    global TEST_PATH
+    global LAYOUT_PATH
+    global SAMPLE_SUBMISSION_PATH
+    global RUN_DATE
+    global OUTPUT_DIR
+    global SUBMISSION_PATH
+    global OOF_PATH
+    global REPORT_PATH
+    global LAG_ROLLING_COLS
+    global MODEL_FAMILIES
+    global OBJECTIVES
+
+    resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
+
+    TARGET = str(cfg.target)
+    ID_COLS = [str(col) for col in cfg.id_cols]
+    MODEL_SEED = int(cfg.model_seed)
+    N_SPLITS = int(cfg.cv.n_splits)
+    CV_SEED = int(cfg.cv.seed)
+    RUN_DATE = str(OmegaConf.select(cfg, "run.date"))
+
+    DATA_DIR = Path(to_absolute_path(str(cfg.data.dir)))
+    TRAIN_PATH = DATA_DIR / str(cfg.data.train)
+    TEST_PATH = DATA_DIR / str(cfg.data.test)
+    LAYOUT_PATH = DATA_DIR / str(cfg.data.layout)
+    SAMPLE_SUBMISSION_PATH = DATA_DIR / str(cfg.data.sample_submission)
+
+    OUTPUT_DIR = Path(to_absolute_path(str(cfg.output.dir)))
+    SUBMISSION_PATH = OUTPUT_DIR / str(cfg.output.submission)
+    OOF_PATH = OUTPUT_DIR / str(cfg.output.oof)
+    REPORT_PATH = OUTPUT_DIR / str(cfg.output.report)
+
+    LAG_ROLLING_COLS = [str(col) for col in cfg.features.lag_rolling_cols]
+    MODEL_FAMILIES = [str(model_family) for model_family in cfg.models.families]
+    OBJECTIVES = list(OmegaConf.to_container(cfg.objectives, resolve=True))
+
+    return resolved_cfg
 
 
 def log(message: str) -> None:
@@ -226,7 +283,11 @@ def make_stratified_group_splits(train: pd.DataFrame) -> tuple[list[tuple[np.nda
     return splits, fold_ids
 
 
-def make_model_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
+def make_model_key(model_family: str, objective: dict[str, Any]) -> str:
+    return f"{model_family}_{objective['name']}"
+
+
+def make_lightgbm_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
     params: dict[str, Any] = {
         "n_estimators": 1800,
         "learning_rate": 0.035,
@@ -243,20 +304,122 @@ def make_model_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
         "verbose": -1,
         "force_col_wise": True,
     }
-    params.update(objective["params"])
+    params.update(objective["params"]["lightgbm"])
     return params
 
 
+def make_xgboost_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "n_estimators": 1800,
+        "learning_rate": 0.035,
+        "max_depth": 8,
+        "min_child_weight": 50,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "random_state": seed,
+        "n_jobs": -1,
+        "tree_method": "hist",
+        "enable_categorical": True,
+        "eval_metric": "mae",
+        "early_stopping_rounds": 100,
+        "verbosity": 0,
+    }
+    params.update(objective["params"]["xgboost"])
+    return params
+
+
+def make_catboost_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "iterations": 1800,
+        "learning_rate": 0.035,
+        "depth": 8,
+        "l2_leaf_reg": 3.0,
+        "random_seed": seed,
+        "eval_metric": "MAE",
+        "od_type": "Iter",
+        "od_wait": 100,
+        "thread_count": -1,
+        "verbose": False,
+        "allow_writing_files": False,
+    }
+    params.update(objective["params"]["catboost"])
+    return params
+
+
+def fit_predict_fold(
+    model_family: str,
+    objective: dict[str, Any],
+    seed: int,
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    X_test: pd.DataFrame,
+    categorical_features: list[str],
+) -> tuple[np.ndarray, np.ndarray, int]:
+    if model_family == "lightgbm":
+        model = LGBMRegressor(**make_lightgbm_params(objective, seed))
+        model.fit(
+            X_tr,
+            y_tr,
+            eval_set=[(X_val, y_val)],
+            eval_metric="mae",
+            categorical_feature=categorical_features,
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=100, verbose=False),
+                lgb.log_evaluation(period=0),
+            ],
+        )
+        best_iteration = int(model.best_iteration_ or model.n_estimators_)
+        valid_pred = model.predict(X_val, num_iteration=model.best_iteration_)
+        test_pred = model.predict(X_test, num_iteration=model.best_iteration_)
+        return valid_pred, test_pred, best_iteration
+
+    if model_family == "xgboost":
+        model = XGBRegressor(**make_xgboost_params(objective, seed))
+        model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        best_index = getattr(model, "best_iteration", None)
+        best_iteration = (
+            int(best_index + 1) if best_index is not None else int(model.n_estimators)
+        )
+        predict_kwargs = {"iteration_range": (0, best_iteration)}
+        valid_pred = model.predict(X_val, **predict_kwargs)
+        test_pred = model.predict(X_test, **predict_kwargs)
+        return valid_pred, test_pred, best_iteration
+
+    if model_family == "catboost":
+        model = CatBoostRegressor(**make_catboost_params(objective, seed))
+        model.fit(
+            X_tr,
+            y_tr,
+            cat_features=categorical_features,
+            eval_set=(X_val, y_val),
+            use_best_model=True,
+            verbose=False,
+        )
+        best_index = model.get_best_iteration()
+        best_iteration = (
+            int(best_index + 1) if best_index is not None else int(model.tree_count_)
+        )
+        valid_pred = model.predict(X_val)
+        test_pred = model.predict(X_test)
+        return valid_pred, test_pred, best_iteration
+
+    raise ValueError(f"Unsupported model family: {model_family}")
+
+
 def train_one_cv(
+    model_family: str,
     train: pd.DataFrame,
     test: pd.DataFrame,
     feature_cols: list[str],
     categorical_features: list[str],
     splits: list[tuple[np.ndarray, np.ndarray]],
     objective: dict[str, Any],
-    seed: int,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-    model_key = f"{objective['name']}_seed{seed}"
+    model_key = make_model_key(model_family, objective)
     log(f"[train] start {model_key}")
 
     oof = np.full(len(train), np.nan, dtype=np.float64)
@@ -274,38 +437,28 @@ def train_one_cv(
     )
     for fold, (tr_idx, val_idx) in fold_iter:
         started_at = time.time()
-        model = LGBMRegressor(**make_model_params(objective, seed))
-        model.fit(
-            train.iloc[tr_idx][feature_cols],
-            train.iloc[tr_idx][TARGET],
-            eval_set=[(train.iloc[val_idx][feature_cols], train.iloc[val_idx][TARGET])],
-            eval_metric="mae",
-            categorical_feature=categorical_features,
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=100, verbose=False),
-                lgb.log_evaluation(period=0),
-            ],
-        )
-
-        valid_pred = model.predict(
-            train.iloc[val_idx][feature_cols],
-            num_iteration=model.best_iteration_,
-        )
-        fold_test_pred = model.predict(
-            test[feature_cols],
-            num_iteration=model.best_iteration_,
+        valid_pred, fold_test_pred, best_iteration = fit_predict_fold(
+            model_family=model_family,
+            objective=objective,
+            seed=MODEL_SEED,
+            X_tr=train.iloc[tr_idx][feature_cols],
+            y_tr=train.iloc[tr_idx][TARGET],
+            X_val=train.iloc[val_idx][feature_cols],
+            y_val=train.iloc[val_idx][TARGET],
+            X_test=test[feature_cols],
+            categorical_features=categorical_features,
         )
 
         oof[val_idx] = valid_pred
         test_pred += fold_test_pred / len(splits)
         fold_mae = mean_absolute_error(train.iloc[val_idx][TARGET], valid_pred)
         elapsed = time.time() - started_at
-        best_iteration = int(model.best_iteration_ or model.n_estimators_)
 
         report = {
             "model_key": model_key,
+            "model_family": model_family,
             "objective": objective["name"],
-            "seed": seed,
+            "model_seed": MODEL_SEED,
             "fold": fold,
             "valid_rows": int(len(val_idx)),
             "mae": to_float(fold_mae),
@@ -346,8 +499,8 @@ def evaluate_layout_group_risk(
     log("[layout-risk] start GroupKFold by layout_id")
     splitter = GroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=CV_SEED)
     splits = list(splitter.split(train, groups=train["layout_id"].to_numpy()))
+    model_family = "lightgbm"
     objective = OBJECTIVES[0]
-    seed = SEEDS[0]
 
     oof = np.full(len(train), np.nan, dtype=np.float64)
     fold_reports: list[dict[str, Any]] = []
@@ -362,7 +515,7 @@ def evaluate_layout_group_risk(
     )
     for fold, (tr_idx, val_idx) in fold_iter:
         started_at = time.time()
-        model = LGBMRegressor(**make_model_params(objective, seed))
+        model = LGBMRegressor(**make_lightgbm_params(objective, MODEL_SEED))
         model.fit(
             train.iloc[tr_idx][feature_cols],
             train.iloc[tr_idx][TARGET],
@@ -409,8 +562,9 @@ def evaluate_layout_group_risk(
 
     fold_scores = [r["mae"] for r in fold_reports]
     result = {
+        "model_family": model_family,
         "objective": objective["name"],
-        "seed": seed,
+        "model_seed": MODEL_SEED,
         "mae": to_float(mean_absolute_error(train[TARGET], oof)),
         "fold_mean": to_float(np.mean(fold_scores)),
         "fold_std": to_float(np.std(fold_scores)),
@@ -528,13 +682,21 @@ def build_oof_frame(
     for key, values in model_oofs.items():
         oof_df[f"oof_{key}"] = values
 
-    for objective in [o["name"] for o in OBJECTIVES]:
-        cols = [values for key, values in model_oofs.items() if key.startswith(f"{objective}_seed")]
-        oof_df[f"oof_objective_{objective}"] = np.mean(cols, axis=0)
+    for model_family in MODEL_FAMILIES:
+        cols = [
+            values
+            for key, values in model_oofs.items()
+            if key.startswith(f"{model_family}_")
+        ]
+        oof_df[f"oof_family_{model_family}"] = np.mean(cols, axis=0)
 
-    for seed in SEEDS:
-        cols = [values for key, values in model_oofs.items() if key.endswith(f"_seed{seed}")]
-        oof_df[f"oof_seed_{seed}"] = np.mean(cols, axis=0)
+    for objective in [o["name"] for o in OBJECTIVES]:
+        cols = [
+            values
+            for key, values in model_oofs.items()
+            if key.endswith(f"_{objective}")
+        ]
+        oof_df[f"oof_objective_{objective}"] = np.mean(cols, axis=0)
 
     oof_df["oof_ensemble_raw"] = ensemble_raw_oof
     oof_df["oof_ensemble_postprocessed"] = ensemble_post_oof
@@ -569,24 +731,34 @@ def summarize_scores(model_oofs: dict[str, np.ndarray], y: pd.Series) -> dict[st
         key: to_float(mean_absolute_error(y, values))
         for key, values in model_oofs.items()
     }
+    by_family = {}
+    for model_family in MODEL_FAMILIES:
+        cols = [
+            values
+            for key, values in model_oofs.items()
+            if key.startswith(f"{model_family}_")
+        ]
+        by_family[model_family] = to_float(mean_absolute_error(y, np.mean(cols, axis=0)))
+
     by_objective = {}
     for objective in [o["name"] for o in OBJECTIVES]:
-        cols = [values for key, values in model_oofs.items() if key.startswith(f"{objective}_seed")]
+        cols = [
+            values
+            for key, values in model_oofs.items()
+            if key.endswith(f"_{objective}")
+        ]
         by_objective[objective] = to_float(mean_absolute_error(y, np.mean(cols, axis=0)))
-
-    by_seed = {}
-    for seed in SEEDS:
-        cols = [values for key, values in model_oofs.items() if key.endswith(f"_seed{seed}")]
-        by_seed[str(seed)] = to_float(mean_absolute_error(y, np.mean(cols, axis=0)))
 
     return {
         "by_model": by_model,
+        "by_family": by_family,
         "by_objective": by_objective,
-        "by_seed": by_seed,
     }
 
 
-def main() -> None:
+@hydra.main(version_base="1.3", config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    resolved_cfg = apply_hydra_config(cfg)
     started_at = time.time()
     phase_timings: dict[str, float] = {}
 
@@ -618,7 +790,11 @@ def main() -> None:
     model_reports: list[dict[str, Any]] = []
 
     train_started_at = time.time()
-    training_tasks = [(objective, seed) for objective in OBJECTIVES for seed in SEEDS]
+    training_tasks = [
+        (model_family, objective)
+        for model_family in MODEL_FAMILIES
+        for objective in OBJECTIVES
+    ]
     model_iter = tqdm(
         training_tasks,
         total=len(training_tasks),
@@ -626,17 +802,17 @@ def main() -> None:
         unit="model",
         dynamic_ncols=True,
     )
-    for objective, seed in model_iter:
-        key = f"{objective['name']}_seed{seed}"
+    for model_family, objective in model_iter:
+        key = make_model_key(model_family, objective)
         model_started_at = time.time()
         oof, test_pred, reports = train_one_cv(
+            model_family=model_family,
             train=train,
             test=test,
             feature_cols=feature_cols,
             categorical_features=categorical_features,
             splits=scenario_splits,
             objective=objective,
-            seed=seed,
         )
         model_elapsed = time.time() - model_started_at
         model_mae = mean_absolute_error(train[TARGET], oof)
@@ -646,8 +822,9 @@ def main() -> None:
         model_reports.append(
             {
                 "model_key": key,
+                "model_family": model_family,
                 "objective": objective["name"],
-                "seed": seed,
+                "model_seed": MODEL_SEED,
                 "mae": to_float(model_mae),
                 "elapsed_sec": to_float(model_elapsed),
             }
@@ -666,6 +843,7 @@ def main() -> None:
     )
 
     phase_started_at = time.time()
+    log(f"[ensemble] average {len(model_oofs)} model predictions")
     ensemble_raw_oof = np.mean(list(model_oofs.values()), axis=0)
     ensemble_raw_test_pred = np.mean(list(model_test_preds.values()), axis=0)
     phase_timings["ensemble_sec"] = to_float(time.time() - phase_started_at)
@@ -708,9 +886,11 @@ def main() -> None:
             "run_date": RUN_DATE,
             "n_splits": N_SPLITS,
             "cv_seed": CV_SEED,
-            "seeds": SEEDS,
+            "model_seed": MODEL_SEED,
+            "model_families": MODEL_FAMILIES,
             "objectives": OBJECTIVES,
             "lag_rolling_cols": LAG_ROLLING_COLS,
+            "hydra": resolved_cfg,
             "outputs": {
                 "submission": str(SUBMISSION_PATH),
                 "oof": str(OOF_PATH),
@@ -731,6 +911,8 @@ def main() -> None:
             "folds": fold_reports,
             "models": model_reports,
             "scores": score_summary,
+            "ensemble_type": "model_average",
+            "ensemble_members": list(model_oofs.keys()),
             "ensemble_raw_mae": to_float(mean_absolute_error(y, ensemble_raw_oof)),
             "ensemble_postprocessed_mae": to_float(mean_absolute_error(y, ensemble_post_oof)),
             "raw_negative_count": int((ensemble_raw_oof < 0).sum()),
