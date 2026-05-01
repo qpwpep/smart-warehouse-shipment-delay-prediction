@@ -61,6 +61,174 @@ LAG_ROLLING_COLS = [
 ]
 
 MODEL_FAMILIES = ["lightgbm", "xgboost", "catboost"]
+FEATURE_DROP_COLS: list[str] = []
+FEATURE_DROP_GROUPS: list[str] = []
+TEMPORAL_SOURCE_COLS = ["day_of_week", "shift_hour"]
+TEMPORAL_CATEGORICAL_FEATURES = ["day_of_week_cat", "shift_hour_cat"]
+TEMPORAL_PERIODS = {
+    "day_of_week": 7,
+    "shift_hour": 24,
+}
+
+FEATURE_GROUP_NAMES = [
+    "layout",
+    "robot_battery",
+    "congestion",
+    "worker",
+    "environment",
+    "network",
+    "order_flow",
+    "shipping_kpi",
+    "temporal",
+    "misc",
+]
+
+FEATURE_GROUP_COLUMNS = {
+    "layout": {
+        "layout_type",
+        "aisle_width_avg",
+        "intersection_count",
+        "one_way_ratio",
+        "pack_station_count",
+        "charger_count",
+        "layout_compactness",
+        "zone_dispersion",
+        "robot_total",
+        "building_age_years",
+        "floor_area_sqm",
+        "ceiling_height_m",
+        "fire_sprinkler_count",
+        "emergency_exit_count",
+        "storage_density_pct",
+        "vertical_utilization",
+        "racking_height_avg_m",
+        "charger_per_robot",
+        "pack_station_per_order",
+        "area_per_robot",
+        "intersection_per_area",
+    },
+    "robot_battery": {
+        "robot_active",
+        "robot_idle",
+        "robot_charging",
+        "robot_utilization",
+        "avg_trip_distance",
+        "task_reassign_15m",
+        "battery_mean",
+        "battery_std",
+        "low_battery_ratio",
+        "charge_queue_length",
+        "avg_charge_wait",
+        "fleet_age_months_avg",
+        "maintenance_schedule_score",
+        "robot_firmware_update_days",
+        "avg_idle_duration_min",
+        "charge_efficiency_pct",
+        "battery_cycle_count_avg",
+        "agv_task_success_rate",
+        "robot_calibration_score",
+        "charge_pressure",
+        "robot_total_gap",
+        "active_robot_share",
+    },
+    "congestion": {
+        "congestion_score",
+        "max_zone_density",
+        "blocked_path_15m",
+        "near_collision_15m",
+        "fault_count_15m",
+        "avg_recovery_time",
+        "replenishment_overlap",
+        "aisle_traffic_score",
+        "path_optimization_score",
+        "intersection_wait_time_avg",
+        "congestion_pressure",
+    },
+    "worker": {
+        "worker_avg_tenure_months",
+        "safety_score_monthly",
+        "manual_override_ratio",
+        "staff_on_floor",
+        "forklift_active_count",
+    },
+    "environment": {
+        "warehouse_temp_avg",
+        "humidity_pct",
+        "external_temp_c",
+        "wind_speed_kmh",
+        "precipitation_mm",
+        "lighting_level_lux",
+        "ambient_noise_db",
+        "floor_vibration_idx",
+        "air_quality_idx",
+        "co2_level_ppm",
+        "hvac_power_kw",
+        "ups_battery_pct",
+        "lighting_zone_variance",
+        "cold_storage_temp_c",
+        "zone_temp_variance",
+    },
+    "network": {
+        "wms_response_time_ms",
+        "scanner_error_rate",
+        "wifi_signal_db",
+        "network_latency_ms",
+        "label_print_queue",
+        "barcode_read_success_rate",
+    },
+    "order_flow": {
+        "order_inflow_15m",
+        "unique_sku_15m",
+        "avg_items_per_order",
+        "urgent_order_ratio",
+        "heavy_item_ratio",
+        "cold_chain_ratio",
+        "sku_concentration",
+        "return_order_ratio",
+        "conveyor_speed_mps",
+        "prev_shift_volume",
+        "avg_package_weight_kg",
+        "inventory_turnover_rate",
+        "daily_forecast_accuracy",
+        "order_wave_count",
+        "pick_list_length_avg",
+        "pack_utilization",
+        "bulk_order_ratio",
+        "pallet_wrap_time_min",
+        "inflow_per_active_robot",
+        "sku_per_order",
+    },
+    "shipping_kpi": {
+        "kpi_otd_pct",
+        "backorder_ratio",
+        "shift_handover_delay_min",
+        "sort_accuracy_pct",
+        "outbound_truck_wait_min",
+        "dock_to_stock_hours",
+        "quality_check_rate",
+        "loading_dock_util",
+        "express_lane_util",
+        "staging_area_util",
+        "cross_dock_ratio",
+        "packaging_material_cost",
+    },
+    "temporal": {
+        "scenario_step",
+        "day_of_week_sin",
+        "day_of_week_cos",
+        "day_of_week_cat",
+        "shift_hour_sin",
+        "shift_hour_cos",
+        "shift_hour_cat",
+    },
+}
+
+LAG_DERIVED_SUFFIXES = (
+    "_lag1",
+    "_delta1",
+    "_rolling3_mean",
+    "_rolling5_mean",
+)
 
 LOGGER = logging.getLogger("train")
 
@@ -98,6 +266,8 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global LAG_ROLLING_COLS
     global MODEL_FAMILIES
     global OBJECTIVES
+    global FEATURE_DROP_COLS
+    global FEATURE_DROP_GROUPS
 
     resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
 
@@ -122,6 +292,10 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     REPORT_PATH = OUTPUT_DIR / str(cfg.output.report)
     LOG_PATH = OUTPUT_DIR / str(OmegaConf.select(cfg, "output.log", default="train.log"))
 
+    FEATURE_DROP_COLS = [str(col) for col in OmegaConf.select(cfg, "features.drop_cols", default=[])]
+    FEATURE_DROP_GROUPS = [
+        str(group) for group in OmegaConf.select(cfg, "features.drop_groups", default=[])
+    ]
     LAG_ROLLING_COLS = [str(col) for col in cfg.features.lag_rolling_cols]
     MODEL_FAMILIES = [str(model_family) for model_family in cfg.models.families]
     OBJECTIVES = list(OmegaConf.to_container(cfg.objectives, resolve=True))
@@ -289,11 +463,96 @@ def add_pressure_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col, period in TEMPORAL_PERIODS.items():
+        if col not in df.columns:
+            raise ValueError(f"Missing temporal source column: {col}")
+
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        rounded = numeric.round()
+        invalid = numeric.notna() & (
+            (rounded < 0) | (rounded >= period) | ~np.isclose(numeric, rounded)
+        )
+        if invalid.any():
+            bad_values = sorted(numeric[invalid].dropna().unique().tolist())[:10]
+            raise ValueError(f"{col} contains invalid cyclic values: {bad_values}")
+
+        radians = 2 * np.pi * numeric / period
+        df[f"{col}_sin"] = np.sin(radians)
+        df[f"{col}_cos"] = np.cos(radians)
+
+        categories = [str(i) for i in range(period)] + ["missing"]
+        labels = rounded.astype("Int64").astype("string").fillna("missing")
+        df[f"{col}_cat"] = labels.astype(
+            CategoricalDtype(categories=categories, ordered=False)
+        )
+
+    return df
+
+
+def strip_lag_suffix(col: str) -> str:
+    for suffix in LAG_DERIVED_SUFFIXES:
+        if col.endswith(suffix):
+            return col[: -len(suffix)]
+    return col
+
+
+def infer_feature_group(col: str) -> str:
+    base_col = strip_lag_suffix(col)
+    for group, columns in FEATURE_GROUP_COLUMNS.items():
+        if base_col in columns:
+            return group
+    return "misc"
+
+
+def build_feature_group_map(feature_cols: list[str]) -> dict[str, str]:
+    return {col: infer_feature_group(col) for col in feature_cols}
+
+
+def count_feature_groups(feature_group_map: dict[str, str]) -> dict[str, int]:
+    return {
+        group: int(sum(1 for value in feature_group_map.values() if value == group))
+        for group in FEATURE_GROUP_NAMES
+    }
+
+
+def apply_feature_pruning(
+    feature_cols: list[str],
+    feature_group_map: dict[str, str],
+) -> tuple[list[str], dict[str, Any]]:
+    unknown_groups = sorted(set(FEATURE_DROP_GROUPS) - set(FEATURE_GROUP_NAMES))
+    if unknown_groups:
+        raise ValueError(f"Unknown feature drop groups: {unknown_groups}")
+
+    unknown_cols = sorted(set(FEATURE_DROP_COLS) - set(feature_cols))
+    if unknown_cols:
+        raise ValueError(f"Unknown feature drop columns: {unknown_cols}")
+
+    dropped_by_group = {
+        group: sorted([col for col, value in feature_group_map.items() if value == group])
+        for group in FEATURE_DROP_GROUPS
+    }
+    dropped_cols = sorted(set(FEATURE_DROP_COLS).union(*dropped_by_group.values()))
+    kept_cols = [col for col in feature_cols if col not in dropped_cols]
+    kept_group_map = {col: feature_group_map[col] for col in kept_cols}
+
+    report = {
+        "drop_cols": FEATURE_DROP_COLS,
+        "drop_groups": FEATURE_DROP_GROUPS,
+        "dropped_cols": dropped_cols,
+        "dropped_by_group": dropped_by_group,
+        "dropped_count": int(len(dropped_cols)),
+        "group_counts": count_feature_groups(kept_group_map),
+    }
+    return kept_cols, report
+
+
 def build_features(
     train_raw: pd.DataFrame,
     test_raw: pd.DataFrame,
     layout: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str], dict[str, str], dict[str, Any]]:
     layout_type_dtype = CategoricalDtype(
         categories=sorted(layout["layout_type"].dropna().unique()),
         ordered=False,
@@ -308,8 +567,13 @@ def build_features(
     train = add_pressure_features(train)
     test = add_pressure_features(test)
 
-    feature_cols = [c for c in train.columns if c not in ID_COLS + [TARGET]]
-    test_feature_cols = [c for c in test.columns if c not in ID_COLS]
+    train = add_temporal_features(train)
+    test = add_temporal_features(test)
+
+    excluded_train_cols = set(ID_COLS + [TARGET] + TEMPORAL_SOURCE_COLS)
+    excluded_test_cols = set(ID_COLS + TEMPORAL_SOURCE_COLS)
+    feature_cols = [c for c in train.columns if c not in excluded_train_cols]
+    test_feature_cols = [c for c in test.columns if c not in excluded_test_cols]
     if feature_cols != test_feature_cols:
         missing_in_test = sorted(set(feature_cols) - set(test_feature_cols))
         extra_in_test = sorted(set(test_feature_cols) - set(feature_cols))
@@ -318,12 +582,18 @@ def build_features(
             f"missing_in_test={missing_in_test}, extra_in_test={extra_in_test}"
         )
 
+    base_feature_group_map = build_feature_group_map(feature_cols)
+    feature_cols, pruning_report = apply_feature_pruning(feature_cols, base_feature_group_map)
+    feature_group_map = {col: base_feature_group_map[col] for col in feature_cols}
+
     object_features = train[feature_cols].select_dtypes(include="object").columns.tolist()
     if object_features:
         raise ValueError(f"Unexpected object feature columns: {object_features}")
 
-    categorical_features = ["layout_type"]
-    return train, test, feature_cols, categorical_features
+    categorical_features = [
+        col for col in ["layout_type"] + TEMPORAL_CATEGORICAL_FEATURES if col in feature_cols
+    ]
+    return train, test, feature_cols, categorical_features, feature_group_map, pruning_report
 
 
 def make_stratified_group_splits(train: pd.DataFrame) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
@@ -841,7 +1111,9 @@ def main(cfg: DictConfig) -> None:
 
     phase_started_at = time.time()
     log("[features] build features")
-    train, test, feature_cols, categorical_features = build_features(train_raw, test_raw, layout)
+    train, test, feature_cols, categorical_features, feature_group_map, pruning_report = (
+        build_features(train_raw, test_raw, layout)
+    )
     train.attrs["test_scenario_step"] = test["scenario_step"]
     phase_timings["feature_build_sec"] = to_float(time.time() - phase_started_at)
     log(
@@ -978,7 +1250,14 @@ def main(cfg: DictConfig) -> None:
             "test_shape": list(test_raw.shape),
             "layout_shape": list(layout.shape),
             "feature_count": int(len(feature_cols)),
+            "feature_columns": feature_cols,
             "categorical_features": categorical_features,
+            "temporal_source_columns_excluded": TEMPORAL_SOURCE_COLS,
+            "feature_pruning": pruning_report,
+            "feature_groups": {
+                "counts": count_feature_groups(feature_group_map),
+                "by_feature": feature_group_map,
+            },
             "scenario_count": int(train["scenario_id"].nunique()),
             "layout_count": int(train["layout_id"].nunique()),
             "test_layout_count": int(test["layout_id"].nunique()),

@@ -30,6 +30,8 @@ output:
   log: train.log
 
 features:
+  drop_cols: []
+  drop_groups: []
   lag_rolling_cols:
     - order_inflow_15m
     - congestion_score
