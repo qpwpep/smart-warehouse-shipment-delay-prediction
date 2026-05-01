@@ -59,6 +59,17 @@ models:
     catboost:
       iterations: 1800
 
+analysis:
+  enabled: true
+  ablation:
+    enabled: true
+  permutation_importance:
+    enabled: true
+    max_rows_per_fold: 5000
+    n_repeats: 2
+    recommended_drop_delta_threshold: 0.0
+    recommended_drop_positive_fold_rate: 0.6
+
 objectives:
   - name: mae
     params:

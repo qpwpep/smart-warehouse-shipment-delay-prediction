@@ -78,6 +78,14 @@ TEMPORAL_PERIODS = {
     "shift_hour": 24,
 }
 
+ANALYSIS_ENABLED = False
+ANALYSIS_ABLATION_ENABLED = True
+ANALYSIS_PERMUTATION_ENABLED = True
+ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD: int | None = 5000
+ANALYSIS_PERMUTATION_N_REPEATS = 2
+ANALYSIS_RECOMMENDED_DROP_DELTA_THRESHOLD = 0.0
+ANALYSIS_RECOMMENDED_DROP_POSITIVE_FOLD_RATE = 0.6
+
 FEATURE_GROUP_NAMES = [
     "layout",
     "robot_battery",
@@ -278,6 +286,13 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global OBJECTIVES
     global FEATURE_DROP_COLS
     global FEATURE_DROP_GROUPS
+    global ANALYSIS_ENABLED
+    global ANALYSIS_ABLATION_ENABLED
+    global ANALYSIS_PERMUTATION_ENABLED
+    global ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD
+    global ANALYSIS_PERMUTATION_N_REPEATS
+    global ANALYSIS_RECOMMENDED_DROP_DELTA_THRESHOLD
+    global ANALYSIS_RECOMMENDED_DROP_POSITIVE_FOLD_RATE
 
     resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
 
@@ -323,6 +338,36 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
         resolve=True,
     )
     OBJECTIVES = list(OmegaConf.to_container(cfg.objectives, resolve=True))
+    ANALYSIS_ENABLED = bool(OmegaConf.select(cfg, "analysis.enabled", default=False))
+    ANALYSIS_ABLATION_ENABLED = bool(
+        OmegaConf.select(cfg, "analysis.ablation.enabled", default=True)
+    )
+    ANALYSIS_PERMUTATION_ENABLED = bool(
+        OmegaConf.select(cfg, "analysis.permutation_importance.enabled", default=True)
+    )
+    max_rows = OmegaConf.select(
+        cfg,
+        "analysis.permutation_importance.max_rows_per_fold",
+        default=5000,
+    )
+    ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD = None if max_rows is None else int(max_rows)
+    ANALYSIS_PERMUTATION_N_REPEATS = int(
+        OmegaConf.select(cfg, "analysis.permutation_importance.n_repeats", default=2)
+    )
+    ANALYSIS_RECOMMENDED_DROP_DELTA_THRESHOLD = float(
+        OmegaConf.select(
+            cfg,
+            "analysis.permutation_importance.recommended_drop_delta_threshold",
+            default=0.0,
+        )
+    )
+    ANALYSIS_RECOMMENDED_DROP_POSITIVE_FOLD_RATE = float(
+        OmegaConf.select(
+            cfg,
+            "analysis.permutation_importance.recommended_drop_positive_fold_rate",
+            default=0.6,
+        )
+    )
 
     return resolved_cfg
 
@@ -954,6 +999,350 @@ def evaluate_layout_group_risk(
     return result
 
 
+def fit_lightgbm_oof_models(
+    train: pd.DataFrame,
+    feature_cols: list[str],
+    categorical_features: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    objective: dict[str, Any],
+    seed: int,
+    desc: str,
+    *,
+    keep_models: bool,
+) -> tuple[np.ndarray, list[dict[str, Any]], list[dict[str, Any]]]:
+    oof = np.full(len(train), np.nan, dtype=np.float64)
+    fold_reports: list[dict[str, Any]] = []
+    fitted_folds: list[dict[str, Any]] = []
+    fold_iter = tqdm(
+        enumerate(splits, start=1),
+        total=len(splits),
+        desc=desc,
+        unit="fold",
+        leave=False,
+        dynamic_ncols=True,
+    )
+
+    for fold, (tr_idx, val_idx) in fold_iter:
+        started_at = time.time()
+        model = LGBMRegressor(**make_lightgbm_params(objective, seed))
+        model.fit(
+            train.iloc[tr_idx][feature_cols],
+            train.iloc[tr_idx][TARGET],
+            eval_set=[(train.iloc[val_idx][feature_cols], train.iloc[val_idx][TARGET])],
+            eval_metric="mae",
+            categorical_feature=categorical_features,
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=100, verbose=False),
+                lgb.log_evaluation(period=0),
+            ],
+        )
+        valid_pred = model.predict(
+            train.iloc[val_idx][feature_cols],
+            num_iteration=model.best_iteration_,
+        )
+        oof[val_idx] = valid_pred
+        fold_mae = mean_absolute_error(train.iloc[val_idx][TARGET], valid_pred)
+        elapsed = time.time() - started_at
+        best_iteration = int(model.best_iteration_ or model.n_estimators_)
+        fold_report = {
+            "fold": fold,
+            "valid_rows": int(len(val_idx)),
+            "mae": to_float(fold_mae),
+            "best_iteration": best_iteration,
+            "elapsed_sec": to_float(elapsed),
+        }
+        fold_reports.append(fold_report)
+        if keep_models:
+            fitted_folds.append(
+                {
+                    "fold": fold,
+                    "model": model,
+                    "val_idx": val_idx,
+                    "best_iteration": best_iteration,
+                }
+            )
+        fold_iter.set_postfix(
+            {
+                "mae": f"{fold_mae:.5f}",
+                "best": best_iteration,
+                "time": format_duration(elapsed),
+            }
+        )
+
+    if np.isnan(oof).any():
+        raise ValueError(f"OOF prediction has NaN values for {desc}.")
+    return oof, fold_reports, fitted_folds
+
+
+def run_group_ablation(
+    train: pd.DataFrame,
+    feature_cols: list[str],
+    categorical_features: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    feature_group_map: dict[str, str],
+    baseline_mae: float,
+    objective: dict[str, Any],
+    seed: int,
+) -> dict[str, Any]:
+    log("[analysis] start feature group ablation")
+    started_at = time.time()
+    groups: list[dict[str, Any]] = []
+    for group in FEATURE_GROUP_NAMES:
+        removed_features = [
+            col for col in feature_cols if feature_group_map.get(col) == group
+        ]
+        if not removed_features:
+            continue
+
+        ablated_features = [col for col in feature_cols if col not in removed_features]
+        ablated_categoricals = [
+            col for col in categorical_features if col in ablated_features
+        ]
+        oof, fold_reports, _ = fit_lightgbm_oof_models(
+            train=train,
+            feature_cols=ablated_features,
+            categorical_features=ablated_categoricals,
+            splits=splits,
+            objective=objective,
+            seed=seed,
+            desc=f"ablation {group}",
+            keep_models=False,
+        )
+        mae = mean_absolute_error(train[TARGET], oof)
+        result = {
+            "group": group,
+            "removed_feature_count": int(len(removed_features)),
+            "removed_features": removed_features,
+            "mae": to_float(mae),
+            "delta_mae_vs_baseline": to_float(mae - baseline_mae),
+            "folds": fold_reports,
+        }
+        groups.append(result)
+        log(
+            f"[analysis] ablation group={group} "
+            f"mae={mae:.5f} delta={mae - baseline_mae:.5f}"
+        )
+
+    return {
+        "enabled": True,
+        "baseline_mae": to_float(baseline_mae),
+        "groups": groups,
+        "elapsed_sec": to_float(time.time() - started_at),
+    }
+
+
+def shuffled_feature_values(series: pd.Series, rng: np.random.Generator) -> Any:
+    values = series.to_numpy(copy=True)
+    rng.shuffle(values)
+    if isinstance(series.dtype, CategoricalDtype):
+        return pd.Categorical(
+            values,
+            categories=series.cat.categories,
+            ordered=series.cat.ordered,
+        )
+    return values
+
+
+def summarize_permutation_by_group(
+    feature_reports: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    group_summary: dict[str, dict[str, Any]] = {}
+    for group in FEATURE_GROUP_NAMES:
+        group_features = [r for r in feature_reports if r["group"] == group]
+        if not group_features:
+            continue
+        deltas = [r["delta_mae_mean"] for r in group_features]
+        group_summary[group] = {
+            "feature_count": int(len(group_features)),
+            "delta_mae_mean": to_float(np.mean(deltas)),
+            "recommended_drop_count": int(
+                sum(1 for r in group_features if r["recommended_drop"])
+            ),
+        }
+    return group_summary
+
+
+def run_permutation_importance(
+    train: pd.DataFrame,
+    feature_cols: list[str],
+    fitted_folds: list[dict[str, Any]],
+    feature_group_map: dict[str, str],
+    seed: int,
+) -> dict[str, Any]:
+    if ANALYSIS_PERMUTATION_N_REPEATS < 1:
+        raise ValueError("analysis.permutation_importance.n_repeats must be >= 1.")
+
+    log("[analysis] start OOF permutation importance")
+    started_at = time.time()
+    feature_fold_deltas: dict[str, list[float]] = {col: [] for col in feature_cols}
+    feature_repeat_deltas: dict[str, list[float]] = {col: [] for col in feature_cols}
+    baseline_fold_reports: list[dict[str, Any]] = []
+
+    for fold_info in fitted_folds:
+        fold = int(fold_info["fold"])
+        model = fold_info["model"]
+        val_idx = fold_info["val_idx"]
+        X_val = train.iloc[val_idx][feature_cols]
+        y_val = train.iloc[val_idx][TARGET]
+
+        if (
+            ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD is not None
+            and len(X_val) > ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD
+        ):
+            rng = np.random.default_rng(seed + fold)
+            sample_pos = np.sort(
+                rng.choice(
+                    len(X_val),
+                    size=ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD,
+                    replace=False,
+                )
+            )
+            X_eval = X_val.iloc[sample_pos].copy()
+            y_eval = y_val.iloc[sample_pos]
+        else:
+            X_eval = X_val.copy()
+            y_eval = y_val
+
+        baseline_pred = model.predict(X_eval, num_iteration=model.best_iteration_)
+        baseline_mae = mean_absolute_error(y_eval, baseline_pred)
+        baseline_fold_reports.append(
+            {
+                "fold": fold,
+                "rows": int(len(X_eval)),
+                "baseline_mae": to_float(baseline_mae),
+            }
+        )
+
+        for feature in feature_cols:
+            fold_deltas: list[float] = []
+            for repeat in range(ANALYSIS_PERMUTATION_N_REPEATS):
+                rng = np.random.default_rng(seed + fold * 1000 + repeat)
+                X_permuted = X_eval.copy()
+                X_permuted[feature] = shuffled_feature_values(X_eval[feature], rng)
+                permuted_pred = model.predict(
+                    X_permuted,
+                    num_iteration=model.best_iteration_,
+                )
+                permuted_mae = mean_absolute_error(y_eval, permuted_pred)
+                delta = to_float(permuted_mae - baseline_mae)
+                fold_deltas.append(delta)
+                feature_repeat_deltas[feature].append(delta)
+            feature_fold_deltas[feature].append(to_float(np.mean(fold_deltas)))
+
+    feature_reports: list[dict[str, Any]] = []
+    for feature in feature_cols:
+        fold_deltas = np.asarray(feature_fold_deltas[feature], dtype=np.float64)
+        repeat_deltas = np.asarray(feature_repeat_deltas[feature], dtype=np.float64)
+        positive_fold_rate = to_float(np.mean(fold_deltas > 0))
+        delta_mean = to_float(np.mean(repeat_deltas))
+        delta_std = to_float(np.std(repeat_deltas))
+        feature_reports.append(
+            {
+                "feature": feature,
+                "group": feature_group_map.get(feature, "misc"),
+                "delta_mae_mean": delta_mean,
+                "delta_mae_std": delta_std,
+                "positive_fold_rate": positive_fold_rate,
+                "recommended_drop": bool(
+                    delta_mean <= ANALYSIS_RECOMMENDED_DROP_DELTA_THRESHOLD
+                    or positive_fold_rate < ANALYSIS_RECOMMENDED_DROP_POSITIVE_FOLD_RATE
+                ),
+                "fold_delta_mae_mean": [to_float(value) for value in fold_deltas],
+            }
+        )
+
+    feature_reports = sorted(
+        feature_reports,
+        key=lambda r: r["delta_mae_mean"],
+    )
+    recommended_drop_features = [
+        r["feature"] for r in feature_reports if r["recommended_drop"]
+    ]
+    return {
+        "enabled": True,
+        "max_rows_per_fold": ANALYSIS_PERMUTATION_MAX_ROWS_PER_FOLD,
+        "n_repeats": ANALYSIS_PERMUTATION_N_REPEATS,
+        "recommended_drop_delta_threshold": ANALYSIS_RECOMMENDED_DROP_DELTA_THRESHOLD,
+        "recommended_drop_positive_fold_rate": ANALYSIS_RECOMMENDED_DROP_POSITIVE_FOLD_RATE,
+        "baseline_folds": baseline_fold_reports,
+        "recommended_drop_features": recommended_drop_features,
+        "features": feature_reports,
+        "by_group": summarize_permutation_by_group(feature_reports),
+        "elapsed_sec": to_float(time.time() - started_at),
+    }
+
+
+def run_feature_analysis(
+    train: pd.DataFrame,
+    feature_cols: list[str],
+    categorical_features: list[str],
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    feature_group_map: dict[str, str],
+) -> dict[str, Any]:
+    if not ANALYSIS_ENABLED:
+        return {"enabled": False}
+
+    analysis_seed = MODEL_SEEDS[0]
+    objective = OBJECTIVES[0]
+    started_at = time.time()
+    log(
+        "[analysis] enabled "
+        f"model_family=lightgbm objective={objective['name']} seed={analysis_seed}"
+    )
+
+    baseline_oof, baseline_folds, fitted_folds = fit_lightgbm_oof_models(
+        train=train,
+        feature_cols=feature_cols,
+        categorical_features=categorical_features,
+        splits=splits,
+        objective=objective,
+        seed=analysis_seed,
+        desc="analysis baseline",
+        keep_models=ANALYSIS_PERMUTATION_ENABLED,
+    )
+    baseline_mae = mean_absolute_error(train[TARGET], baseline_oof)
+    result: dict[str, Any] = {
+        "enabled": True,
+        "model_family": "lightgbm",
+        "objective": objective["name"],
+        "model_seed": analysis_seed,
+        "split_seed": analysis_seed,
+        "baseline": {
+            "mae": to_float(baseline_mae),
+            "folds": baseline_folds,
+        },
+    }
+
+    if ANALYSIS_ABLATION_ENABLED:
+        result["group_ablation"] = run_group_ablation(
+            train=train,
+            feature_cols=feature_cols,
+            categorical_features=categorical_features,
+            splits=splits,
+            feature_group_map=feature_group_map,
+            baseline_mae=to_float(baseline_mae),
+            objective=objective,
+            seed=analysis_seed,
+        )
+    else:
+        result["group_ablation"] = {"enabled": False}
+
+    if ANALYSIS_PERMUTATION_ENABLED:
+        result["permutation_importance"] = run_permutation_importance(
+            train=train,
+            feature_cols=feature_cols,
+            fitted_folds=fitted_folds,
+            feature_group_map=feature_group_map,
+            seed=analysis_seed,
+        )
+    else:
+        result["permutation_importance"] = {"enabled": False}
+
+    result["elapsed_sec"] = to_float(time.time() - started_at)
+    log(f"[analysis] done elapsed={format_duration(result['elapsed_sec'])}")
+    return result
+
+
 def apply_postprocessing(
     pred: np.ndarray,
     steps: pd.Series,
@@ -1272,6 +1661,16 @@ def main(cfg: DictConfig) -> None:
     phase_timings["layout_risk_sec"] = to_float(time.time() - phase_started_at)
 
     phase_started_at = time.time()
+    feature_analysis = run_feature_analysis(
+        train=train,
+        feature_cols=feature_cols,
+        categorical_features=categorical_features,
+        splits=scenario_splits_by_seed[MODEL_SEEDS[0]],
+        feature_group_map=feature_group_map,
+    )
+    phase_timings["feature_analysis_sec"] = to_float(time.time() - phase_started_at)
+
+    phase_started_at = time.time()
     log("[output] write OOF, submission, report")
     oof_df = build_oof_frame(
         train=train,
@@ -1344,6 +1743,7 @@ def main(cfg: DictConfig) -> None:
             "candidates": postprocess_reports,
             "selected": selected_postprocessing,
         },
+        "feature_analysis": feature_analysis,
         "submission_checks": {
             "rows": int(len(submission)),
             "target_min": to_float(submission[TARGET].min()),
