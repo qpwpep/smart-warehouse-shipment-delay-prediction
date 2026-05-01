@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import warnings
 from datetime import datetime
@@ -9,6 +10,7 @@ from typing import Any
 
 from catboost import CatBoostRegressor
 import hydra
+from hydra.core.hydra_config import HydraConfig
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -37,10 +39,15 @@ LAYOUT_PATH = DATA_DIR / "layout_info.csv"
 SAMPLE_SUBMISSION_PATH = DATA_DIR / "sample_submission.csv"
 
 RUN_DATE = datetime.now().astimezone().date().isoformat()
-OUTPUT_DIR = Path("outputs") / RUN_DATE
+RUN_TIMESTAMP = datetime.now().astimezone().strftime("%Y-%m-%d-%H-%M-%S")
+RUN_ID = RUN_TIMESTAMP
+OUTPUT_DIR = Path("outputs") / RUN_ID
 SUBMISSION_PATH = OUTPUT_DIR / "submission.csv"
 OOF_PATH = OUTPUT_DIR / "oof_train.csv"
 REPORT_PATH = OUTPUT_DIR / "cv_report_train.json"
+LOG_PATH = OUTPUT_DIR / "train.log"
+HYDRA_RUN_DIR: Path | None = None
+HYDRA_LOG_PATH: Path | None = None
 
 LAG_ROLLING_COLS = [
     "order_inflow_15m",
@@ -54,6 +61,8 @@ LAG_ROLLING_COLS = [
 ]
 
 MODEL_FAMILIES = ["lightgbm", "xgboost", "catboost"]
+
+LOGGER = logging.getLogger("train")
 
 OBJECTIVES = [
     {
@@ -79,10 +88,13 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global LAYOUT_PATH
     global SAMPLE_SUBMISSION_PATH
     global RUN_DATE
+    global RUN_TIMESTAMP
+    global RUN_ID
     global OUTPUT_DIR
     global SUBMISSION_PATH
     global OOF_PATH
     global REPORT_PATH
+    global LOG_PATH
     global LAG_ROLLING_COLS
     global MODEL_FAMILIES
     global OBJECTIVES
@@ -95,6 +107,8 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     N_SPLITS = int(cfg.cv.n_splits)
     CV_SEED = int(cfg.cv.seed)
     RUN_DATE = str(OmegaConf.select(cfg, "run.date"))
+    RUN_TIMESTAMP = str(OmegaConf.select(cfg, "run.timestamp"))
+    RUN_ID = str(OmegaConf.select(cfg, "run.id"))
 
     DATA_DIR = Path(to_absolute_path(str(cfg.data.dir)))
     TRAIN_PATH = DATA_DIR / str(cfg.data.train)
@@ -106,6 +120,7 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     SUBMISSION_PATH = OUTPUT_DIR / str(cfg.output.submission)
     OOF_PATH = OUTPUT_DIR / str(cfg.output.oof)
     REPORT_PATH = OUTPUT_DIR / str(cfg.output.report)
+    LOG_PATH = OUTPUT_DIR / str(OmegaConf.select(cfg, "output.log", default="train.log"))
 
     LAG_ROLLING_COLS = [str(col) for col in cfg.features.lag_rolling_cols]
     MODEL_FAMILIES = [str(model_family) for model_family in cfg.models.families]
@@ -114,8 +129,63 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     return resolved_cfg
 
 
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            tqdm.write(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+def get_hydra_run_dir() -> Path | None:
+    try:
+        return Path(str(HydraConfig.get().runtime.output_dir)).resolve()
+    except Exception:
+        return None
+
+
+def setup_logging() -> None:
+    global HYDRA_RUN_DIR
+    global HYDRA_LOG_PATH
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    HYDRA_RUN_DIR = get_hydra_run_dir()
+    HYDRA_LOG_PATH = HYDRA_RUN_DIR / "train.log" if HYDRA_RUN_DIR is not None else None
+
+    LOGGER.handlers.clear()
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stdout_handler = TqdmLoggingHandler()
+    stdout_handler.setFormatter(formatter)
+    LOGGER.addHandler(stdout_handler)
+
+    file_paths = [LOG_PATH]
+    if HYDRA_LOG_PATH is not None and HYDRA_LOG_PATH.resolve() != LOG_PATH.resolve():
+        file_paths.append(HYDRA_LOG_PATH)
+
+    for path in file_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        LOGGER.addHandler(file_handler)
+
+    log(f"[logging] output_log={LOG_PATH.resolve()}")
+    if HYDRA_LOG_PATH is not None:
+        log(f"[logging] hydra_log={HYDRA_LOG_PATH.resolve()}")
+
+
 def log(message: str) -> None:
-    tqdm.write(message)
+    LOGGER.info(message)
+
+
+def path_str(path: Path | None) -> str | None:
+    return None if path is None else str(path.resolve())
 
 
 def format_duration(seconds: float) -> str:
@@ -759,6 +829,7 @@ def summarize_scores(model_oofs: dict[str, np.ndarray], y: pd.Series) -> dict[st
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     resolved_cfg = apply_hydra_config(cfg)
+    setup_logging()
     started_at = time.time()
     phase_timings: dict[str, float] = {}
 
@@ -866,7 +937,6 @@ def main(cfg: DictConfig) -> None:
 
     phase_started_at = time.time()
     log("[output] write OOF, submission, report")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     oof_df = build_oof_frame(
         train=train,
         fold_ids=fold_ids,
@@ -884,6 +954,8 @@ def main(cfg: DictConfig) -> None:
     report = {
         "config": {
             "run_date": RUN_DATE,
+            "run_timestamp": RUN_TIMESTAMP,
+            "run_id": RUN_ID,
             "n_splits": N_SPLITS,
             "cv_seed": CV_SEED,
             "model_seed": MODEL_SEED,
@@ -892,9 +964,13 @@ def main(cfg: DictConfig) -> None:
             "lag_rolling_cols": LAG_ROLLING_COLS,
             "hydra": resolved_cfg,
             "outputs": {
-                "submission": str(SUBMISSION_PATH),
-                "oof": str(OOF_PATH),
-                "report": str(REPORT_PATH),
+                "output_dir": path_str(OUTPUT_DIR),
+                "submission": path_str(SUBMISSION_PATH),
+                "oof": path_str(OOF_PATH),
+                "report": path_str(REPORT_PATH),
+                "log_file": path_str(LOG_PATH),
+                "hydra_run_dir": path_str(HYDRA_RUN_DIR),
+                "hydra_log_file": path_str(HYDRA_LOG_PATH),
             },
         },
         "data": {

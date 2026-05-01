@@ -12,6 +12,8 @@ cv:
 
 run:
   date: ${now:%Y-%m-%d}
+  timestamp: ${now:%Y-%m-%d-%H-%M-%S}
+  id: ${run.timestamp}
 
 data:
   dir: data
@@ -21,10 +23,11 @@ data:
   sample_submission: sample_submission.csv
 
 output:
-  dir: outputs/${run.date}
+  dir: outputs/${run.id}
   submission: submission.csv
   oof: oof_train.csv
   report: cv_report_train.json
+  log: train.log
 
 features:
   lag_rolling_cols:
