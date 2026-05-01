@@ -61,6 +61,12 @@ LAG_ROLLING_COLS = [
 ]
 
 MODEL_FAMILIES = ["lightgbm", "xgboost", "catboost"]
+MODEL_PARAMS: dict[str, dict[str, Any]] = {
+    "lightgbm": {},
+    "xgboost": {},
+    "catboost": {},
+}
+
 FEATURE_DROP_COLS: list[str] = []
 FEATURE_DROP_GROUPS: list[str] = []
 TEMPORAL_SOURCE_COLS = ["day_of_week", "shift_hour"]
@@ -265,6 +271,7 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global LOG_PATH
     global LAG_ROLLING_COLS
     global MODEL_FAMILIES
+    global MODEL_PARAMS
     global OBJECTIVES
     global FEATURE_DROP_COLS
     global FEATURE_DROP_GROUPS
@@ -298,6 +305,10 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     ]
     LAG_ROLLING_COLS = [str(col) for col in cfg.features.lag_rolling_cols]
     MODEL_FAMILIES = [str(model_family) for model_family in cfg.models.families]
+    MODEL_PARAMS = OmegaConf.to_container(
+        OmegaConf.select(cfg, "models.params", default={}),
+        resolve=True,
+    )
     OBJECTIVES = list(OmegaConf.to_container(cfg.objectives, resolve=True))
 
     return resolved_cfg
@@ -644,6 +655,7 @@ def make_lightgbm_params(objective: dict[str, Any], seed: int) -> dict[str, Any]
         "verbose": -1,
         "force_col_wise": True,
     }
+    params.update(MODEL_PARAMS.get("lightgbm", {}))
     params.update(objective["params"]["lightgbm"])
     return params
 
@@ -666,6 +678,7 @@ def make_xgboost_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
         "early_stopping_rounds": 100,
         "verbosity": 0,
     }
+    params.update(MODEL_PARAMS.get("xgboost", {}))
     params.update(objective["params"]["xgboost"])
     return params
 
@@ -684,6 +697,7 @@ def make_catboost_params(objective: dict[str, Any], seed: int) -> dict[str, Any]
         "verbose": False,
         "allow_writing_files": False,
     }
+    params.update(MODEL_PARAMS.get("catboost", {}))
     params.update(objective["params"]["catboost"])
     return params
 
@@ -1232,6 +1246,7 @@ def main(cfg: DictConfig) -> None:
             "cv_seed": CV_SEED,
             "model_seed": MODEL_SEED,
             "model_families": MODEL_FAMILIES,
+            "model_params": MODEL_PARAMS,
             "objectives": OBJECTIVES,
             "lag_rolling_cols": LAG_ROLLING_COLS,
             "hydra": resolved_cfg,

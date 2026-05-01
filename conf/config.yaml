@@ -46,7 +46,14 @@ models:
   families:
     - lightgbm
     - xgboost
-    - catboost
+    # - catboost
+  params:
+    lightgbm:
+      n_estimators: 1800
+    xgboost:
+      n_estimators: 1800
+    catboost:
+      iterations: 1800
 
 objectives:
   - name: mae
