@@ -5,6 +5,10 @@ id_cols:
   - scenario_id
 
 model_seed: 42
+model_seeds:
+  - 42
+  - 2026
+  - 777
 
 cv:
   n_splits: 5

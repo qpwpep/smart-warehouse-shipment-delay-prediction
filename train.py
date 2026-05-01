@@ -29,6 +29,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 TARGET = "avg_delay_minutes_next_30m"
 ID_COLS = ["ID", "layout_id", "scenario_id"]
 MODEL_SEED = 42
+DEFAULT_MODEL_SEEDS = [42, 2026, 777]
+MODEL_SEEDS = DEFAULT_MODEL_SEEDS.copy()
 N_SPLITS = 5
 CV_SEED = 42
 
@@ -254,6 +256,7 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global TARGET
     global ID_COLS
     global MODEL_SEED
+    global MODEL_SEEDS
     global N_SPLITS
     global CV_SEED
     global DATA_DIR
@@ -280,7 +283,17 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
 
     TARGET = str(cfg.target)
     ID_COLS = [str(col) for col in cfg.id_cols]
-    MODEL_SEED = int(cfg.model_seed)
+    model_seeds_cfg = OmegaConf.select(cfg, "model_seeds")
+    configured_model_seed = int(cfg.model_seed)
+    if model_seeds_cfg is None:
+        MODEL_SEEDS = [configured_model_seed]
+    else:
+        MODEL_SEEDS = [int(seed) for seed in model_seeds_cfg]
+        if configured_model_seed != 42 and MODEL_SEEDS == DEFAULT_MODEL_SEEDS:
+            MODEL_SEEDS = [configured_model_seed]
+    if not MODEL_SEEDS:
+        raise ValueError("model_seeds must contain at least one seed.")
+    MODEL_SEED = int(MODEL_SEEDS[0])
     N_SPLITS = int(cfg.cv.n_splits)
     CV_SEED = int(cfg.cv.seed)
     RUN_DATE = str(OmegaConf.select(cfg, "run.date"))
@@ -607,7 +620,10 @@ def build_features(
     return train, test, feature_cols, categorical_features, feature_group_map, pruning_report
 
 
-def make_stratified_group_splits(train: pd.DataFrame) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
+def make_stratified_group_splits(
+    train: pd.DataFrame,
+    seed: int | None = None,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
     scenario_target_mean = train.groupby("scenario_id")[TARGET].mean()
     scenario_bins = pd.qcut(scenario_target_mean, q=10, labels=False, duplicates="drop")
     row_bins = train["scenario_id"].map(scenario_bins).astype(int).to_numpy()
@@ -615,7 +631,7 @@ def make_stratified_group_splits(train: pd.DataFrame) -> tuple[list[tuple[np.nda
     splitter = StratifiedGroupKFold(
         n_splits=N_SPLITS,
         shuffle=True,
-        random_state=CV_SEED,
+        random_state=CV_SEED if seed is None else seed,
     )
     splits = list(
         splitter.split(
@@ -634,8 +650,9 @@ def make_stratified_group_splits(train: pd.DataFrame) -> tuple[list[tuple[np.nda
     return splits, fold_ids
 
 
-def make_model_key(model_family: str, objective: dict[str, Any]) -> str:
-    return f"{model_family}_{objective['name']}"
+def make_model_key(model_family: str, objective: dict[str, Any], seed: int | None = None) -> str:
+    base_key = f"{model_family}_{objective['name']}"
+    return base_key if seed is None else f"{base_key}_seed{seed}"
 
 
 def make_lightgbm_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
@@ -772,8 +789,9 @@ def train_one_cv(
     categorical_features: list[str],
     splits: list[tuple[np.ndarray, np.ndarray]],
     objective: dict[str, Any],
+    model_seed: int,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-    model_key = make_model_key(model_family, objective)
+    model_key = make_model_key(model_family, objective, model_seed)
     log(f"[train] start {model_key}")
 
     oof = np.full(len(train), np.nan, dtype=np.float64)
@@ -794,7 +812,7 @@ def train_one_cv(
         valid_pred, fold_test_pred, best_iteration = fit_predict_fold(
             model_family=model_family,
             objective=objective,
-            seed=MODEL_SEED,
+            seed=model_seed,
             X_tr=train.iloc[tr_idx][feature_cols],
             y_tr=train.iloc[tr_idx][TARGET],
             X_val=train.iloc[val_idx][feature_cols],
@@ -812,7 +830,8 @@ def train_one_cv(
             "model_key": model_key,
             "model_family": model_family,
             "objective": objective["name"],
-            "model_seed": MODEL_SEED,
+            "model_seed": model_seed,
+            "split_seed": model_seed,
             "fold": fold,
             "valid_rows": int(len(val_idx)),
             "mae": to_float(fold_mae),
@@ -851,6 +870,7 @@ def evaluate_layout_group_risk(
     categorical_features: list[str],
 ) -> dict[str, Any]:
     log("[layout-risk] start GroupKFold by layout_id")
+    analysis_seed = MODEL_SEEDS[0]
     splitter = GroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=CV_SEED)
     splits = list(splitter.split(train, groups=train["layout_id"].to_numpy()))
     model_family = "lightgbm"
@@ -869,7 +889,7 @@ def evaluate_layout_group_risk(
     )
     for fold, (tr_idx, val_idx) in fold_iter:
         started_at = time.time()
-        model = LGBMRegressor(**make_lightgbm_params(objective, MODEL_SEED))
+        model = LGBMRegressor(**make_lightgbm_params(objective, analysis_seed))
         model.fit(
             train.iloc[tr_idx][feature_cols],
             train.iloc[tr_idx][TARGET],
@@ -918,7 +938,8 @@ def evaluate_layout_group_risk(
     result = {
         "model_family": model_family,
         "objective": objective["name"],
-        "model_seed": MODEL_SEED,
+        "model_seed": analysis_seed,
+        "split_seed": CV_SEED,
         "mae": to_float(mean_absolute_error(train[TARGET], oof)),
         "fold_mean": to_float(np.mean(fold_scores)),
         "fold_std": to_float(np.std(fold_scores)),
@@ -1025,13 +1046,16 @@ def select_postprocessing(
 
 def build_oof_frame(
     train: pd.DataFrame,
-    fold_ids: np.ndarray,
+    fold_ids_by_seed: dict[int, np.ndarray],
     model_oofs: dict[str, np.ndarray],
     ensemble_raw_oof: np.ndarray,
     ensemble_post_oof: np.ndarray,
 ) -> pd.DataFrame:
     oof_df = train[ID_COLS + ["scenario_step", TARGET]].copy()
-    oof_df["scenario_cv_fold"] = fold_ids
+    first_seed = MODEL_SEEDS[0]
+    oof_df["scenario_cv_fold"] = fold_ids_by_seed[first_seed]
+    for seed, fold_ids in fold_ids_by_seed.items():
+        oof_df[f"scenario_cv_fold_seed{seed}"] = fold_ids
 
     for key, values in model_oofs.items():
         oof_df[f"oof_{key}"] = values
@@ -1048,9 +1072,17 @@ def build_oof_frame(
         cols = [
             values
             for key, values in model_oofs.items()
-            if key.endswith(f"_{objective}")
+            if f"_{objective}_seed" in key
         ]
         oof_df[f"oof_objective_{objective}"] = np.mean(cols, axis=0)
+
+    for seed in MODEL_SEEDS:
+        cols = [
+            values
+            for key, values in model_oofs.items()
+            if key.endswith(f"_seed{seed}")
+        ]
+        oof_df[f"oof_seed{seed}"] = np.mean(cols, axis=0)
 
     oof_df["oof_ensemble_raw"] = ensemble_raw_oof
     oof_df["oof_ensemble_postprocessed"] = ensemble_post_oof
@@ -1099,14 +1131,24 @@ def summarize_scores(model_oofs: dict[str, np.ndarray], y: pd.Series) -> dict[st
         cols = [
             values
             for key, values in model_oofs.items()
-            if key.endswith(f"_{objective}")
+            if f"_{objective}_seed" in key
         ]
         by_objective[objective] = to_float(mean_absolute_error(y, np.mean(cols, axis=0)))
+
+    by_seed = {}
+    for seed in MODEL_SEEDS:
+        cols = [
+            values
+            for key, values in model_oofs.items()
+            if key.endswith(f"_seed{seed}")
+        ]
+        by_seed[str(seed)] = to_float(mean_absolute_error(y, np.mean(cols, axis=0)))
 
     return {
         "by_model": by_model,
         "by_family": by_family,
         "by_objective": by_objective,
+        "by_seed": by_seed,
     }
 
 
@@ -1137,8 +1179,13 @@ def main(cfg: DictConfig) -> None:
     )
 
     phase_started_at = time.time()
-    log("[cv] build StratifiedGroupKFold by scenario_id")
-    scenario_splits, fold_ids = make_stratified_group_splits(train)
+    log("[cv] build seed-specific StratifiedGroupKFold by scenario_id")
+    scenario_splits_by_seed: dict[int, list[tuple[np.ndarray, np.ndarray]]] = {}
+    fold_ids_by_seed: dict[int, np.ndarray] = {}
+    for seed in MODEL_SEEDS:
+        scenario_splits, fold_ids = make_stratified_group_splits(train, seed=seed)
+        scenario_splits_by_seed[seed] = scenario_splits
+        fold_ids_by_seed[seed] = fold_ids
     phase_timings["scenario_cv_split_sec"] = to_float(time.time() - phase_started_at)
 
     model_oofs: dict[str, np.ndarray] = {}
@@ -1148,7 +1195,8 @@ def main(cfg: DictConfig) -> None:
 
     train_started_at = time.time()
     training_tasks = [
-        (model_family, objective)
+        (seed, model_family, objective)
+        for seed in MODEL_SEEDS
         for model_family in MODEL_FAMILIES
         for objective in OBJECTIVES
     ]
@@ -1159,8 +1207,8 @@ def main(cfg: DictConfig) -> None:
         unit="model",
         dynamic_ncols=True,
     )
-    for model_family, objective in model_iter:
-        key = make_model_key(model_family, objective)
+    for seed, model_family, objective in model_iter:
+        key = make_model_key(model_family, objective, seed)
         model_started_at = time.time()
         oof, test_pred, reports = train_one_cv(
             model_family=model_family,
@@ -1168,8 +1216,9 @@ def main(cfg: DictConfig) -> None:
             test=test,
             feature_cols=feature_cols,
             categorical_features=categorical_features,
-            splits=scenario_splits,
+            splits=scenario_splits_by_seed[seed],
             objective=objective,
+            model_seed=seed,
         )
         model_elapsed = time.time() - model_started_at
         model_mae = mean_absolute_error(train[TARGET], oof)
@@ -1181,7 +1230,8 @@ def main(cfg: DictConfig) -> None:
                 "model_key": key,
                 "model_family": model_family,
                 "objective": objective["name"],
-                "model_seed": MODEL_SEED,
+                "model_seed": seed,
+                "split_seed": seed,
                 "mae": to_float(model_mae),
                 "elapsed_sec": to_float(model_elapsed),
             }
@@ -1225,7 +1275,7 @@ def main(cfg: DictConfig) -> None:
     log("[output] write OOF, submission, report")
     oof_df = build_oof_frame(
         train=train,
-        fold_ids=fold_ids,
+        fold_ids_by_seed=fold_ids_by_seed,
         model_oofs=model_oofs,
         ensemble_raw_oof=ensemble_raw_oof,
         ensemble_post_oof=ensemble_post_oof,
@@ -1245,6 +1295,7 @@ def main(cfg: DictConfig) -> None:
             "n_splits": N_SPLITS,
             "cv_seed": CV_SEED,
             "model_seed": MODEL_SEED,
+            "model_seeds": MODEL_SEEDS,
             "model_families": MODEL_FAMILIES,
             "model_params": MODEL_PARAMS,
             "objectives": OBJECTIVES,
