@@ -73,6 +73,8 @@ MODEL_FAMILY_SEEDS: dict[str, list[int]] = {}
 
 FEATURE_DROP_COLS: list[str] = []
 FEATURE_DROP_GROUPS: list[str] = []
+LONG_ROLLING_MEAN_COLS: list[str] = []
+LONG_ROLLING_MEAN_WINDOWS: list[int] = []
 TEMPORAL_SOURCE_COLS = ["day_of_week", "shift_hour"]
 TEMPORAL_CATEGORICAL_FEATURES = ["day_of_week_cat", "shift_hour_cat"]
 TEMPORAL_PERIODS = {
@@ -292,6 +294,8 @@ LAG_DERIVED_SUFFIXES = (
     "_rolling3_mean",
     "_rolling5_mean",
     "_rolling10_mean",
+    "_rolling15_mean",
+    "_rolling20_mean",
     "_rolling5_std",
 )
 
@@ -336,6 +340,8 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global OBJECTIVES
     global FEATURE_DROP_COLS
     global FEATURE_DROP_GROUPS
+    global LONG_ROLLING_MEAN_COLS
+    global LONG_ROLLING_MEAN_WINDOWS
     global ANALYSIS_ENABLED
     global ANALYSIS_ABLATION_ENABLED
     global ANALYSIS_PERMUTATION_ENABLED
@@ -382,6 +388,14 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
         str(group) for group in OmegaConf.select(cfg, "features.drop_groups", default=[])
     ]
     LAG_ROLLING_COLS = [str(col) for col in cfg.features.lag_rolling_cols]
+    LONG_ROLLING_MEAN_COLS = [
+        str(col)
+        for col in OmegaConf.select(cfg, "features.long_rolling_mean_cols", default=[])
+    ]
+    LONG_ROLLING_MEAN_WINDOWS = [
+        int(window)
+        for window in OmegaConf.select(cfg, "features.long_rolling_mean_windows", default=[])
+    ]
     MODEL_FAMILIES = [str(model_family) for model_family in cfg.models.families]
     MODEL_PARAMS = OmegaConf.to_container(
         OmegaConf.select(cfg, "models.params", default={}),
@@ -622,6 +636,16 @@ def add_scenario_features(df: pd.DataFrame) -> pd.DataFrame:
             derived[f"{col}_rolling{window}_mean"] = lagged_grouped.transform(
                 lambda s, window=window: s.rolling(window=window, min_periods=1).mean()
             )
+        if col in LONG_ROLLING_MEAN_COLS:
+            for window in LONG_ROLLING_MEAN_WINDOWS:
+                if window in (3, 5, 10):
+                    continue
+                derived[f"{col}_rolling{window}_mean"] = lagged_grouped.transform(
+                    lambda s, window=window: s.rolling(
+                        window=window,
+                        min_periods=1,
+                    ).mean()
+                )
         derived[f"{col}_rolling5_std"] = lagged_grouped.transform(
             lambda s: s.rolling(window=5, min_periods=2).std()
         )
@@ -2095,6 +2119,8 @@ def main(cfg: DictConfig) -> None:
             "model_params": MODEL_PARAMS,
             "objectives": OBJECTIVES,
             "lag_rolling_cols": LAG_ROLLING_COLS,
+            "long_rolling_mean_cols": LONG_ROLLING_MEAN_COLS,
+            "long_rolling_mean_windows": LONG_ROLLING_MEAN_WINDOWS,
             "hydra": resolved_cfg,
             "outputs": {
                 "output_dir": path_str(OUTPUT_DIR),

@@ -258,6 +258,22 @@ features:
     - pack_utilization
     - loading_dock_util
     - outbound_truck_wait_min
+  long_rolling_mean_cols:
+    - congestion_score
+    - max_zone_density
+    - pack_utilization
+    - low_battery_ratio
+    - robot_charging
+    - avg_trip_distance
+    - cold_chain_ratio
+    - robot_idle
+    - urgent_order_ratio
+    - avg_items_per_order
+    - robot_utilization
+    - order_inflow_15m
+  long_rolling_mean_windows:
+    - 15
+    - 20
 
 models:
   families:
