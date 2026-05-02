@@ -4,9 +4,13 @@ id_cols:
   - layout_id
   - scenario_id
 
-model_seed: 42
+model_seed: 100
 model_seeds:
-  - 42
+  - 100
+  - 314
+  - 2718
+  - 9001
+  - 4242
   - 2026
   - 777
 
@@ -34,17 +38,226 @@ output:
   log: train.log
 
 features:
-  drop_cols: []
+  drop_cols:
+    - aisle_width_avg
+    - ceiling_height_m
+    - building_age_years
+    - area_per_robot
+    - one_way_ratio
+    - emergency_exit_count
+    - fire_sprinkler_count
+    - charger_count
+    - intersection_per_area
+    - floor_area_sqm
+    - lighting_level_lux
+    - path_optimization_score
+    - external_temp_c
+    - avg_package_weight_kg
+    - cross_dock_ratio
+    - wms_response_time_ms
+    - storage_density_pct
+    - day_of_week_sin
+    - ambient_noise_db
+    - intersection_count
+    - worker_avg_tenure_months
+    - robot_calibration_score
+    - sku_per_order
+    - staff_on_floor
+    - wifi_signal_db
+    - packaging_material_cost
+    - wind_speed_kmh
+    - quality_check_rate
+    - vertical_utilization
+    - staging_area_util
+    - racking_height_avg_m
+    - return_order_ratio
+    - order_wave_count
+    - battery_cycle_count_avg
+    - dock_to_stock_hours
+    - network_latency_ms
+    - maintenance_schedule_score
+    - cold_storage_temp_c
+    - inventory_turnover_rate
+    - backorder_ratio
+    - heavy_item_ratio
+    - congestion_score_delta1
+    - charge_queue_length
+    - conveyor_speed_mps
+    - replenishment_overlap
+    - charger_per_robot
+    - day_of_week_cat
+    - charge_queue_length_lag1
+    - shift_handover_delay_min
+    - task_reassign_15m
+    - charge_queue_length_delta1
+    - robot_total_gap
+    - avg_charge_wait
+    - max_zone_density_delta1
+    - low_battery_ratio_delta1
+    - order_inflow_15m_lag1
+    - intersection_wait_time_avg
+    - precipitation_mm
+    - barcode_read_success_rate
+    - bulk_order_ratio
+    - charge_queue_length_rolling5_mean
+    - robot_charging_lag1
+    - kpi_otd_pct
+    - express_lane_util
+    - robot_charging_rolling3_mean
+    - outbound_truck_wait_min_rolling10_mean
+    - battery_mean_delta1
+    - avg_trip_distance_rolling3_mean
+    - urgent_order_ratio_rolling5_mean
+    - prev_shift_volume
+    - shift_hour_cat
+    - humidity_pct
+    - outbound_truck_wait_min_rolling5_mean
+    - layout_type
+    - urgent_order_count_est
+    - robot_total
+    - blocked_path_15m_rolling10_mean
+    - avg_recovery_time_rolling10_mean
+    - lighting_zone_variance
+    - avg_items_per_order_rolling5_std
+    - battery_mean_delta2
+    - outbound_truck_wait_min_rolling3_mean
+    - pallet_wrap_time_min
+    - avg_items_per_order_rolling3_mean
+    - congestion_score_lag1
+    - heavy_order_count_est
+    - day_of_week_cos
+    - air_quality_idx
+    - robot_firmware_update_days
+    - zone_temp_variance
+    - urgent_order_ratio_lag2
+    - hvac_power_kw
+    - low_battery_robot_count
+    - outbound_truck_wait_min_lag2
+    - otd_gap
+    - task_pressure
+    - outbound_truck_wait_min_lag1
+    - label_print_queue
+    - low_battery_ratio_lag2
+    - battery_std_rolling3_mean
+    - fleet_age_months_avg
+    - charge_queue_length_lag2
+    - urgent_order_ratio_rolling3_mean
+    - loading_dock_util_rolling5_std
+    - sort_accuracy_pct
+    - pack_utilization_delta2
+    - battery_std_lag1
+    - charge_efficiency_pct
+    - forklift_active_count
+    - blocked_path_15m_rolling5_std
+    - truck_wait_load
+    - battery_std_lag2
+    - battery_std_delta1
+    - blocked_path_15m
+    - avg_recovery_time_rolling3_mean
+    - backorder_pressure
+    - daily_forecast_accuracy
+    - robot_charging_rolling5_mean
+    - robot_idle_delta1
+    - avg_items_per_order_delta2
+    - urgent_order_ratio_rolling5_std
+    - task_reassign_15m_rolling5_mean
+    - robot_charging_rolling5_std
+    - avg_items_per_order
+    - task_reassign_15m_rolling3_mean
+    - avg_trip_distance_lag2
+    - low_battery_ratio_rolling5_std
+    - low_battery_ratio_delta2
+    - charge_queue_length_rolling3_mean
+    - loading_dock_util_lag2
+    - avg_trip_distance_delta2
+    - low_battery_ratio
+    - near_collision_15m_lag2
+    - task_reassign_15m_rolling5_std
+    - task_reassign_15m_lag2
+    - cold_chain_ratio_delta2
+    - avg_recovery_time_lag2
+    - charge_queue_length_delta2
+    - blocked_path_15m_lag1
+    - blocked_path_15m_delta2
+    - urgent_order_ratio_lag1
+    - task_reassign_15m_lag1
+    - battery_std_delta2
+    - charge_capacity_gap
+    - avg_recovery_time_delta1
+    - near_collision_15m_lag1
+    - outbound_truck_wait_min_delta2
+    - congestion_pressure
+    - shift_hour_sin
+    - fault_count_15m_delta1
+    - blocked_path_15m_delta1
+    - urgent_order_ratio_delta2
+    - layout_missing_count
+    - worker_missing_count
+    - network_missing_count
+    - order_flow_missing_count
+    - shipping_kpi_missing_count
+    - row_missing_count
+    - row_missing_ratio
+    - scenario_step_is_first
+    - scenario_step_is_last
+    - blocked_path_15m_lag2
+    - near_collision_15m_delta2
+    - fault_count_15m_lag2
+    - fault_count_15m_delta2
+    - task_reassign_15m_delta1
+    - task_reassign_15m_delta2
+    - outbound_truck_wait_min_delta1
+    - near_collision_15m_delta1
+    - urgent_order_ratio_delta1
+    - loading_dock_util_delta2
+    - environment_missing_count
+    - robot_battery_missing_count
+    - congestion_missing_count
+    - avg_trip_distance_delta1
+    - fault_count_15m_rolling5_std
+    - avg_items_per_order_delta1
+    - congestion_score_delta2
+    - near_collision_15m_rolling5_std
+    - battery_std
+    - congestion_score_rolling5_mean
+    - max_zone_density_delta2
+    - battery_std_rolling5_std
+    - avg_recovery_time_lag1
+    - fault_count_15m_rolling5_mean
+    - avg_trip_distance_lag1
+    - outbound_truck_wait_min
+    - low_battery_ratio_rolling5_mean
+    - cold_chain_ratio_lag2
+    - sku_per_staff
+    - robot_charging_delta2
+    - aisle_traffic_score
+    - pick_list_length_avg
+    - avg_trip_distance_rolling5_mean
   drop_groups: []
   lag_rolling_cols:
     - order_inflow_15m
+    - avg_items_per_order
+    - urgent_order_ratio
+    - cold_chain_ratio
     - congestion_score
+    - blocked_path_15m
+    - near_collision_15m
+    - fault_count_15m
+    - avg_recovery_time
+    - robot_active
     - battery_mean
+    - battery_std
     - low_battery_ratio
+    - robot_utilization
     - robot_idle
     - robot_charging
+    - avg_trip_distance
+    - task_reassign_15m
     - charge_queue_length
     - max_zone_density
+    - pack_utilization
+    - loading_dock_util
+    - outbound_truck_wait_min
 
 models:
   families:
@@ -72,11 +285,11 @@ models:
 analysis:
   enabled: true
   ablation:
-    enabled: true
+    enabled: false
   permutation_importance:
     enabled: true
-    max_rows_per_fold: 5000
-    n_repeats: 2
+    max_rows_per_fold: 3000
+    n_repeats: 1
     recommended_drop_delta_threshold: 0.0
     recommended_drop_positive_fold_rate: 0.6
 
