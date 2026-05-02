@@ -96,6 +96,7 @@ FEATURE_GROUP_NAMES = [
     "order_flow",
     "shipping_kpi",
     "temporal",
+    "missingness",
     "misc",
 ]
 
@@ -122,6 +123,7 @@ FEATURE_GROUP_COLUMNS = {
         "pack_station_per_order",
         "area_per_robot",
         "intersection_per_area",
+        "storage_pressure",
     },
     "robot_battery": {
         "robot_active",
@@ -146,6 +148,12 @@ FEATURE_GROUP_COLUMNS = {
         "charge_pressure",
         "robot_total_gap",
         "active_robot_share",
+        "available_robot_share",
+        "charging_robot_share",
+        "idle_robot_share",
+        "low_battery_robot_count",
+        "battery_depletion_pressure",
+        "charge_capacity_gap",
     },
     "congestion": {
         "congestion_score",
@@ -159,6 +167,9 @@ FEATURE_GROUP_COLUMNS = {
         "path_optimization_score",
         "intersection_wait_time_avg",
         "congestion_pressure",
+        "congestion_density_interaction",
+        "incident_count_15m",
+        "incident_per_active_robot",
     },
     "worker": {
         "worker_avg_tenure_months",
@@ -166,6 +177,9 @@ FEATURE_GROUP_COLUMNS = {
         "manual_override_ratio",
         "staff_on_floor",
         "forklift_active_count",
+        "orders_per_staff",
+        "sku_per_staff",
+        "task_pressure",
     },
     "environment": {
         "warehouse_temp_avg",
@@ -191,6 +205,7 @@ FEATURE_GROUP_COLUMNS = {
         "network_latency_ms",
         "label_print_queue",
         "barcode_read_success_rate",
+        "network_error_pressure",
     },
     "order_flow": {
         "order_inflow_15m",
@@ -213,6 +228,14 @@ FEATURE_GROUP_COLUMNS = {
         "pallet_wrap_time_min",
         "inflow_per_active_robot",
         "sku_per_order",
+        "inflow_per_robot_total",
+        "inflow_per_available_robot",
+        "estimated_item_inflow",
+        "items_per_active_robot",
+        "urgent_order_count_est",
+        "heavy_order_count_est",
+        "cold_chain_order_count_est",
+        "packing_load_per_station",
     },
     "shipping_kpi": {
         "kpi_otd_pct",
@@ -227,6 +250,11 @@ FEATURE_GROUP_COLUMNS = {
         "staging_area_util",
         "cross_dock_ratio",
         "packaging_material_cost",
+        "dock_pressure",
+        "truck_wait_load",
+        "otd_gap",
+        "sort_error_pct",
+        "backorder_pressure",
     },
     "temporal": {
         "scenario_step",
@@ -236,14 +264,33 @@ FEATURE_GROUP_COLUMNS = {
         "shift_hour_sin",
         "shift_hour_cos",
         "shift_hour_cat",
+        "scenario_step_ratio",
+        "scenario_step_is_first",
+        "scenario_step_is_last",
+    },
+    "missingness": {
+        "row_missing_count",
+        "row_missing_ratio",
+        "layout_missing_count",
+        "robot_battery_missing_count",
+        "congestion_missing_count",
+        "worker_missing_count",
+        "environment_missing_count",
+        "network_missing_count",
+        "order_flow_missing_count",
+        "shipping_kpi_missing_count",
     },
 }
 
 LAG_DERIVED_SUFFIXES = (
     "_lag1",
+    "_lag2",
     "_delta1",
+    "_delta2",
     "_rolling3_mean",
     "_rolling5_mean",
+    "_rolling10_mean",
+    "_rolling5_std",
 )
 
 LOGGER = logging.getLogger("train")
@@ -483,53 +530,172 @@ def add_layout_features(
     return merged
 
 
+def add_missingness_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    source_groups = [
+        group
+        for group in FEATURE_GROUP_NAMES
+        if group not in {"temporal", "missingness", "misc"}
+    ]
+    row_cols: list[str] = []
+
+    for group in source_groups:
+        cols = sorted(col for col in FEATURE_GROUP_COLUMNS[group] if col in df.columns)
+        if not cols:
+            df[f"{group}_missing_count"] = np.int16(0)
+            continue
+        df[f"{group}_missing_count"] = df[cols].isna().sum(axis=1).astype(np.int16)
+        row_cols.extend(cols)
+
+    row_cols = list(dict.fromkeys(row_cols))
+    if row_cols:
+        row_missing_count = df[row_cols].isna().sum(axis=1)
+        df["row_missing_count"] = row_missing_count.astype(np.int16)
+        df["row_missing_ratio"] = row_missing_count / len(row_cols)
+    else:
+        df["row_missing_count"] = np.int16(0)
+        df["row_missing_ratio"] = 0.0
+
+    return df
+
+
 def add_scenario_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     grouped = df.groupby("scenario_id", sort=False)
-    df["scenario_step"] = grouped.cumcount().astype(np.int16)
+    derived: dict[str, Any] = {}
+    scenario_step = grouped.cumcount().astype(np.int16)
+    derived["scenario_step"] = scenario_step
+    scenario_size = grouped["ID"].transform("size")
+    derived["scenario_step_ratio"] = safe_divide(
+        scenario_step.astype(np.float64),
+        (scenario_size - 1).astype(np.float64),
+    ).fillna(0.0)
+    derived["scenario_step_is_first"] = (scenario_step == 0).astype(np.int8)
+    derived["scenario_step_is_last"] = (scenario_step == scenario_size - 1).astype(
+        np.int8
+    )
 
     for col in LAG_ROLLING_COLS:
         if col not in df.columns:
             raise ValueError(f"Missing lag/rolling source column: {col}")
         lag_col = f"{col}_lag1"
-        df[lag_col] = grouped[col].shift(1)
-        df[f"{col}_delta1"] = df[col] - df[lag_col]
-        df[f"{col}_rolling3_mean"] = grouped[col].transform(
-            lambda s: s.shift(1).rolling(window=3, min_periods=1).mean()
-        )
-        df[f"{col}_rolling5_mean"] = grouped[col].transform(
-            lambda s: s.shift(1).rolling(window=5, min_periods=1).mean()
+        lag1 = grouped[col].shift(1)
+        lag2 = grouped[col].shift(2)
+        derived[lag_col] = lag1
+        derived[f"{col}_lag2"] = lag2
+        derived[f"{col}_delta1"] = df[col] - lag1
+        derived[f"{col}_delta2"] = df[col] - lag2
+
+        lagged_grouped = lag1.groupby(df["scenario_id"], sort=False)
+        for window in (3, 5, 10):
+            derived[f"{col}_rolling{window}_mean"] = lagged_grouped.transform(
+                lambda s, window=window: s.rolling(window=window, min_periods=1).mean()
+            )
+        derived[f"{col}_rolling5_std"] = lagged_grouped.transform(
+            lambda s: s.rolling(window=5, min_periods=2).std()
         )
 
-    return df
+    return pd.concat([df, pd.DataFrame(derived, index=df.index)], axis=1).copy()
 
 
 def add_pressure_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     robot_total = df["robot_total"]
     order_inflow = df["order_inflow_15m"]
+    available_robots = df["robot_active"] + df["robot_idle"]
+    staff_capacity = df["staff_on_floor"] + df["forklift_active_count"]
+    estimated_item_inflow = order_inflow * df["avg_items_per_order"]
+    low_battery_robot_count = df["low_battery_ratio"] * robot_total
+    incident_count = (
+        df["blocked_path_15m"] + df["near_collision_15m"] + df["fault_count_15m"]
+    )
+    derived: dict[str, Any] = {}
 
-    df["inflow_per_active_robot"] = safe_divide(order_inflow, df["robot_active"] + 1)
-    df["sku_per_order"] = safe_divide(df["unique_sku_15m"], order_inflow + 1)
-    df["charge_pressure"] = (
+    derived["inflow_per_active_robot"] = safe_divide(
+        order_inflow,
+        df["robot_active"] + 1,
+    )
+    derived["inflow_per_robot_total"] = safe_divide(order_inflow, robot_total)
+    derived["inflow_per_available_robot"] = safe_divide(
+        order_inflow,
+        available_robots + 1,
+    )
+    derived["sku_per_order"] = safe_divide(df["unique_sku_15m"], order_inflow + 1)
+    derived["orders_per_staff"] = safe_divide(order_inflow, staff_capacity + 1)
+    derived["sku_per_staff"] = safe_divide(df["unique_sku_15m"], staff_capacity + 1)
+    derived["estimated_item_inflow"] = estimated_item_inflow
+    derived["items_per_active_robot"] = safe_divide(
+        estimated_item_inflow,
+        df["robot_active"] + 1,
+    )
+    derived["urgent_order_count_est"] = order_inflow * df["urgent_order_ratio"]
+    derived["heavy_order_count_est"] = order_inflow * df["heavy_item_ratio"]
+    derived["cold_chain_order_count_est"] = order_inflow * df["cold_chain_ratio"]
+    derived["charge_pressure"] = (
         df["robot_charging"]
         + df["charge_queue_length"]
-        + df["low_battery_ratio"] * robot_total
+        + low_battery_robot_count
     )
-    df["congestion_pressure"] = (
+    derived["low_battery_robot_count"] = low_battery_robot_count
+    derived["battery_depletion_pressure"] = (
+        low_battery_robot_count + df["charge_queue_length"] + df["avg_charge_wait"]
+    )
+    derived["charge_capacity_gap"] = (
+        df["charger_count"] - df["robot_charging"] - df["charge_queue_length"]
+    )
+    derived["congestion_pressure"] = (
         df["congestion_score"]
         + 20 * df["max_zone_density"]
         + 2 * df["blocked_path_15m"]
     )
-    df["charger_per_robot"] = safe_divide(df["charger_count"], robot_total)
-    df["pack_station_per_order"] = safe_divide(df["pack_station_count"], order_inflow + 1)
-    df["area_per_robot"] = safe_divide(df["floor_area_sqm"], robot_total)
-    df["intersection_per_area"] = safe_divide(df["intersection_count"], df["floor_area_sqm"])
-    df["robot_total_gap"] = robot_total - (
+    derived["congestion_density_interaction"] = (
+        df["congestion_score"] * df["max_zone_density"]
+    )
+    derived["incident_count_15m"] = incident_count
+    derived["incident_per_active_robot"] = safe_divide(
+        incident_count,
+        df["robot_active"] + 1,
+    )
+    derived["charger_per_robot"] = safe_divide(df["charger_count"], robot_total)
+    derived["pack_station_per_order"] = safe_divide(
+        df["pack_station_count"],
+        order_inflow + 1,
+    )
+    derived["area_per_robot"] = safe_divide(df["floor_area_sqm"], robot_total)
+    derived["intersection_per_area"] = safe_divide(
+        df["intersection_count"],
+        df["floor_area_sqm"],
+    )
+    derived["robot_total_gap"] = robot_total - (
         df["robot_active"] + df["robot_idle"] + df["robot_charging"]
     )
-    df["active_robot_share"] = safe_divide(df["robot_active"], robot_total)
-    return df
+    derived["active_robot_share"] = safe_divide(df["robot_active"], robot_total)
+    derived["available_robot_share"] = safe_divide(available_robots, robot_total)
+    derived["charging_robot_share"] = safe_divide(df["robot_charging"], robot_total)
+    derived["idle_robot_share"] = safe_divide(df["robot_idle"], robot_total)
+    derived["packing_load_per_station"] = safe_divide(
+        estimated_item_inflow * (1 + df["pack_utilization"]),
+        df["pack_station_count"] + 1,
+    )
+    derived["task_pressure"] = (
+        df["task_reassign_15m"] + df["manual_override_ratio"] * df["robot_active"]
+    )
+    derived["dock_pressure"] = (
+        df["loading_dock_util"]
+        + df["express_lane_util"]
+        + df["staging_area_util"]
+        + safe_divide(df["outbound_truck_wait_min"], pd.Series(60.0, index=df.index))
+    )
+    derived["truck_wait_load"] = df["outbound_truck_wait_min"] * df["loading_dock_util"]
+    derived["otd_gap"] = 100.0 - df["kpi_otd_pct"]
+    derived["sort_error_pct"] = 100.0 - df["sort_accuracy_pct"]
+    derived["backorder_pressure"] = df["backorder_ratio"] * order_inflow
+    derived["network_error_pressure"] = (
+        df["wms_response_time_ms"] * df["scanner_error_rate"]
+        + df["network_latency_ms"] * (1 - df["barcode_read_success_rate"])
+    )
+    derived["storage_pressure"] = df["storage_density_pct"] * df["vertical_utilization"]
+    return pd.concat([df, pd.DataFrame(derived, index=df.index)], axis=1).copy()
 
 
 def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -629,6 +795,9 @@ def build_features(
 
     train = add_layout_features(train_raw, layout, layout_type_dtype)
     test = add_layout_features(test_raw, layout, layout_type_dtype)
+
+    train = add_missingness_features(train)
+    test = add_missingness_features(test)
 
     train = add_scenario_features(train)
     test = add_scenario_features(test)
