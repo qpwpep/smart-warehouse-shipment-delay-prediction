@@ -68,6 +68,7 @@ MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "xgboost": {},
     "catboost": {},
 }
+MODEL_FAMILY_SEEDS: dict[str, list[int]] = {}
 
 FEATURE_DROP_COLS: list[str] = []
 FEATURE_DROP_GROUPS: list[str] = []
@@ -330,6 +331,7 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
     global LAG_ROLLING_COLS
     global MODEL_FAMILIES
     global MODEL_PARAMS
+    global MODEL_FAMILY_SEEDS
     global OBJECTIVES
     global FEATURE_DROP_COLS
     global FEATURE_DROP_GROUPS
@@ -384,6 +386,34 @@ def apply_hydra_config(cfg: DictConfig) -> dict[str, Any]:
         OmegaConf.select(cfg, "models.params", default={}),
         resolve=True,
     )
+    raw_family_seeds = OmegaConf.to_container(
+        OmegaConf.select(cfg, "models.family_seeds", default={}),
+        resolve=True,
+    )
+    raw_family_seeds = {} if raw_family_seeds is None else dict(raw_family_seeds)
+    raw_family_seeds = {
+        model_family: seeds
+        for model_family, seeds in raw_family_seeds.items()
+        if model_family in MODEL_FAMILIES
+    }
+    MODEL_FAMILY_SEEDS = {}
+    for model_family in MODEL_FAMILIES:
+        seeds = raw_family_seeds.get(model_family)
+        if seeds is not None:
+            family_seeds = [int(seed) for seed in seeds]
+            if not family_seeds:
+                raise ValueError(f"models.family_seeds.{model_family} is empty.")
+            MODEL_FAMILY_SEEDS[model_family] = family_seeds
+    if MODEL_FAMILY_SEEDS:
+        for model_family in MODEL_FAMILIES:
+            MODEL_FAMILY_SEEDS.setdefault(model_family, MODEL_SEEDS.copy())
+        unique_model_seeds: list[int] = []
+        for model_family in MODEL_FAMILIES:
+            for seed in MODEL_FAMILY_SEEDS[model_family]:
+                if seed not in unique_model_seeds:
+                    unique_model_seeds.append(seed)
+        MODEL_SEEDS = unique_model_seeds
+        MODEL_SEED = int(MODEL_SEEDS[0])
     OBJECTIVES = list(OmegaConf.to_container(cfg.objectives, resolve=True))
     ANALYSIS_ENABLED = bool(OmegaConf.select(cfg, "analysis.enabled", default=False))
     ANALYSIS_ABLATION_ENABLED = bool(
@@ -869,6 +899,21 @@ def make_model_key(model_family: str, objective: dict[str, Any], seed: int | Non
     return base_key if seed is None else f"{base_key}_seed{seed}"
 
 
+def get_model_key_family(model_key: str) -> str:
+    for objective in [objective["name"] for objective in OBJECTIVES]:
+        seeded_marker = f"_{objective}_seed"
+        if seeded_marker in model_key:
+            return model_key.split(seeded_marker, maxsplit=1)[0]
+        objective_suffix = f"_{objective}"
+        if model_key.endswith(objective_suffix):
+            return model_key[: -len(objective_suffix)]
+    return model_key
+
+
+def get_model_family_seeds(model_family: str) -> list[int]:
+    return MODEL_FAMILY_SEEDS.get(model_family, MODEL_SEEDS)
+
+
 def make_lightgbm_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
     params: dict[str, Any] = {
         "n_estimators": 1800,
@@ -891,7 +936,11 @@ def make_lightgbm_params(objective: dict[str, Any], seed: int) -> dict[str, Any]
     return params
 
 
-def make_xgboost_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
+def make_xgboost_params(
+    model_family: str,
+    objective: dict[str, Any],
+    seed: int,
+) -> dict[str, Any]:
     params: dict[str, Any] = {
         "n_estimators": 1800,
         "learning_rate": 0.035,
@@ -910,6 +959,8 @@ def make_xgboost_params(objective: dict[str, Any], seed: int) -> dict[str, Any]:
         "verbosity": 0,
     }
     params.update(MODEL_PARAMS.get("xgboost", {}))
+    if model_family != "xgboost":
+        params.update(MODEL_PARAMS.get(model_family, {}))
     params.update(objective["params"]["xgboost"])
     return params
 
@@ -962,8 +1013,8 @@ def fit_predict_fold(
         test_pred = model.predict(X_test, num_iteration=model.best_iteration_)
         return valid_pred, test_pred, best_iteration
 
-    if model_family == "xgboost":
-        model = XGBRegressor(**make_xgboost_params(objective, seed))
+    if model_family.startswith("xgboost"):
+        model = XGBRegressor(**make_xgboost_params(model_family, objective, seed))
         model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
         best_index = getattr(model, "best_iteration", None)
         best_iteration = (
@@ -1622,7 +1673,7 @@ def build_oof_frame(
         cols = [
             values
             for key, values in model_oofs.items()
-            if key.startswith(f"{model_family}_")
+            if get_model_key_family(key) == model_family
         ]
         oof_df[f"oof_family_{model_family}"] = np.mean(cols, axis=0)
 
@@ -1680,7 +1731,7 @@ def summarize_scores(model_oofs: dict[str, np.ndarray], y: pd.Series) -> dict[st
         cols = [
             values
             for key, values in model_oofs.items()
-            if key.startswith(f"{model_family}_")
+            if get_model_key_family(key) == model_family
         ]
         by_family[model_family] = to_float(mean_absolute_error(y, np.mean(cols, axis=0)))
 
@@ -1754,8 +1805,8 @@ def main(cfg: DictConfig) -> None:
     train_started_at = time.time()
     training_tasks = [
         (seed, model_family, objective)
-        for seed in MODEL_SEEDS
         for model_family in MODEL_FAMILIES
+        for seed in get_model_family_seeds(model_family)
         for objective in OBJECTIVES
     ]
     model_iter = tqdm(
@@ -1865,6 +1916,7 @@ def main(cfg: DictConfig) -> None:
             "model_seed": MODEL_SEED,
             "model_seeds": MODEL_SEEDS,
             "model_families": MODEL_FAMILIES,
+            "model_family_seeds": MODEL_FAMILY_SEEDS,
             "model_params": MODEL_PARAMS,
             "objectives": OBJECTIVES,
             "lag_rolling_cols": LAG_ROLLING_COLS,

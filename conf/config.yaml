@@ -48,14 +48,24 @@ features:
 
 models:
   families:
-    - lightgbm
     - xgboost
-    # - catboost
+    - xgboost_lr025
+    - catboost
+  family_seeds:
+    xgboost:
+      - 100
+    xgboost_lr025:
+      - 100
+    catboost:
+      - 2026
   params:
     lightgbm:
       n_estimators: 1800
     xgboost:
       n_estimators: 1800
+    xgboost_lr025:
+      n_estimators: 2600
+      learning_rate: 0.025
     catboost:
       iterations: 1800
 
