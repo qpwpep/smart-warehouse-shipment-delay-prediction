@@ -233,6 +233,36 @@ features:
     - aisle_traffic_score
     - pick_list_length_avg
     - avg_trip_distance_rolling5_mean
+    - scanner_error_rate
+    - avg_trip_distance
+    - order_inflow_15m_rolling5_mean
+    - sort_error_pct
+    - avg_items_per_order_lag2
+    - cold_chain_order_count_est
+    - estimated_item_inflow
+    - avg_trip_distance_rolling5_std
+    - fault_count_15m_rolling10_mean
+    - loading_dock_util
+    - avg_items_per_order_lag1
+    - avg_recovery_time_rolling5_mean
+    - storage_pressure
+    - order_inflow_15m_delta1
+    - order_inflow_15m_rolling3_mean
+    - congestion_score_rolling3_mean
+    - shift_hour_cos
+    - order_inflow_15m_lag2
+    - loading_dock_util_delta1
+    - robot_utilization_delta1
+    - floor_vibration_idx
+    - outbound_truck_wait_min_rolling5_std
+    - network_error_pressure
+    - near_collision_15m
+    - near_collision_15m_rolling5_mean
+    - inflow_per_robot_total
+    - robot_idle_lag2
+    - urgent_order_ratio
+    - pack_utilization_lag1
+    - robot_utilization_rolling3_mean
   drop_groups: []
   lag_rolling_cols:
     - order_inflow_15m
@@ -278,13 +308,15 @@ features:
 models:
   families:
     - xgboost
-    - xgboost_lr025
+    - xgboost_depth9
     - catboost
   family_seeds:
     xgboost:
       - 100
-    xgboost_lr025:
+    xgboost_depth9:
       - 100
+      - 314
+      - 2718
     catboost:
       - 2026
   params:
@@ -292,9 +324,10 @@ models:
       n_estimators: 1800
     xgboost:
       n_estimators: 1800
-    xgboost_lr025:
+    xgboost_depth9:
       n_estimators: 2600
       learning_rate: 0.025
+      max_depth: 9
     catboost:
       iterations: 1800
 
