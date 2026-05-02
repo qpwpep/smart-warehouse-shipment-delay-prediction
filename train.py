@@ -19,6 +19,7 @@ from hydra.utils import to_absolute_path
 from lightgbm import LGBMRegressor
 from omegaconf import DictConfig, OmegaConf
 from pandas.api.types import CategoricalDtype
+from scipy.optimize import minimize
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 from tqdm.auto import tqdm
@@ -1129,6 +1130,173 @@ def train_one_cv(
     return oof, test_pred, fold_reports
 
 
+def normalize_weights(weights: np.ndarray) -> np.ndarray:
+    normalized = np.clip(np.asarray(weights, dtype=np.float64), 0.0, None)
+    weight_sum = float(normalized.sum())
+    if weight_sum <= 0:
+        return np.full(len(normalized), 1.0 / len(normalized), dtype=np.float64)
+    return normalized / weight_sum
+
+
+def make_ensemble_weight_starts(model_keys: list[str]) -> list[tuple[str, np.ndarray]]:
+    n_models = len(model_keys)
+    starts: list[tuple[str, np.ndarray]] = [
+        ("uniform", np.full(n_models, 1.0 / n_models, dtype=np.float64))
+    ]
+
+    for idx, model_key in enumerate(model_keys):
+        start = np.zeros(n_models, dtype=np.float64)
+        start[idx] = 1.0
+        starts.append((f"single:{model_key}", start))
+
+    for model_family in MODEL_FAMILIES:
+        indices = [
+            idx
+            for idx, model_key in enumerate(model_keys)
+            if get_model_key_family(model_key) == model_family
+        ]
+        if indices and len(indices) < n_models:
+            start = np.zeros(n_models, dtype=np.float64)
+            start[indices] = 1.0 / len(indices)
+            starts.append((f"family:{model_family}", start))
+
+    for seed in MODEL_SEEDS:
+        suffix = f"_seed{seed}"
+        indices = [
+            idx
+            for idx, model_key in enumerate(model_keys)
+            if model_key.endswith(suffix)
+        ]
+        if indices and len(indices) < n_models:
+            start = np.zeros(n_models, dtype=np.float64)
+            start[indices] = 1.0 / len(indices)
+            starts.append((f"seed:{seed}", start))
+
+    return starts
+
+
+def optimize_ensemble_weights(
+    model_oofs: dict[str, np.ndarray],
+    y: pd.Series,
+) -> dict[str, Any]:
+    model_keys = list(model_oofs.keys())
+    if not model_keys:
+        raise ValueError("No model predictions available for ensemble.")
+
+    y_values = y.to_numpy(dtype=np.float64)
+    oof_matrix = np.column_stack([model_oofs[key] for key in model_keys]).astype(np.float64)
+    n_models = len(model_keys)
+
+    if n_models == 1:
+        weights = np.array([1.0], dtype=np.float64)
+        mae = mean_absolute_error(y_values, oof_matrix[:, 0])
+        return {
+            "type": "single_model",
+            "model_keys": model_keys,
+            "weights": {model_keys[0]: 1.0},
+            "weight_values": weights.tolist(),
+            "mae": to_float(mae),
+            "simple_average_mae": to_float(mae),
+            "optimizer": {"enabled": False, "reason": "single_model"},
+            "candidates": [],
+        }
+
+    def objective(weights: np.ndarray) -> float:
+        return float(np.mean(np.abs(y_values - oof_matrix @ weights)))
+
+    simple_weights = np.full(n_models, 1.0 / n_models, dtype=np.float64)
+    best_weights = simple_weights.copy()
+    best_mae = objective(best_weights)
+    candidate_reports: list[dict[str, Any]] = [
+        {
+            "start": "uniform",
+            "success": True,
+            "message": "initial uniform average",
+            "mae": to_float(best_mae),
+            "weights": {
+                key: to_float(weight)
+                for key, weight in zip(model_keys, best_weights, strict=True)
+            },
+        }
+    ]
+
+    constraints = {"type": "eq", "fun": lambda weights: float(np.sum(weights) - 1.0)}
+    bounds = [(0.0, 1.0)] * n_models
+    starts = make_ensemble_weight_starts(model_keys)
+
+    for start_name, start_weights in starts:
+        result = minimize(
+            objective,
+            normalize_weights(start_weights),
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"maxiter": 1000, "ftol": 1e-10, "disp": False},
+        )
+        weights = normalize_weights(result.x if result.x is not None else start_weights)
+        mae = objective(weights)
+        candidate_reports.append(
+            {
+                "start": start_name,
+                "success": bool(result.success),
+                "message": str(result.message),
+                "mae": to_float(mae),
+                "weights": {
+                    key: to_float(weight)
+                    for key, weight in zip(model_keys, weights, strict=True)
+                },
+            }
+        )
+        if mae < best_mae:
+            best_mae = mae
+            best_weights = weights
+
+    cleaned_weights = best_weights.copy()
+    cleaned_weights[cleaned_weights < 1e-8] = 0.0
+    cleaned_weights = normalize_weights(cleaned_weights)
+    cleaned_mae = objective(cleaned_weights)
+    if cleaned_mae <= best_mae + 1e-10:
+        best_weights = cleaned_weights
+        best_mae = cleaned_mae
+
+    return {
+        "type": "mae_optimized_nonnegative_weighted_average",
+        "model_keys": model_keys,
+        "weights": {
+            key: to_float(weight)
+            for key, weight in zip(model_keys, best_weights, strict=True)
+        },
+        "weight_values": [to_float(weight) for weight in best_weights],
+        "mae": to_float(best_mae),
+        "simple_average_mae": to_float(objective(simple_weights)),
+        "optimizer": {
+            "enabled": True,
+            "method": "scipy.optimize.minimize:SLSQP",
+            "bounds": "0 <= weight <= 1",
+            "constraint": "sum(weights) == 1",
+            "start_count": int(len(starts)),
+        },
+        "candidates": candidate_reports,
+    }
+
+
+def apply_ensemble_weights(
+    model_predictions: dict[str, np.ndarray],
+    ensemble_report: dict[str, Any],
+) -> np.ndarray:
+    model_keys = list(ensemble_report["model_keys"])
+    missing_keys = sorted(set(model_keys) - set(model_predictions))
+    if missing_keys:
+        raise ValueError(f"Missing model predictions for ensemble: {missing_keys}")
+
+    weights = np.array(
+        [ensemble_report["weights"][key] for key in model_keys],
+        dtype=np.float64,
+    )
+    prediction_matrix = np.column_stack([model_predictions[key] for key in model_keys])
+    return prediction_matrix @ weights
+
+
 def evaluate_layout_group_risk(
     train: pd.DataFrame,
     feature_cols: list[str],
@@ -1859,10 +2027,17 @@ def main(cfg: DictConfig) -> None:
     )
 
     phase_started_at = time.time()
-    log(f"[ensemble] average {len(model_oofs)} model predictions")
-    ensemble_raw_oof = np.mean(list(model_oofs.values()), axis=0)
-    ensemble_raw_test_pred = np.mean(list(model_test_preds.values()), axis=0)
+    log(f"[ensemble] optimize non-negative weights for {len(model_oofs)} model predictions")
+    ensemble_weighting = optimize_ensemble_weights(model_oofs, train[TARGET])
+    ensemble_raw_oof = apply_ensemble_weights(model_oofs, ensemble_weighting)
+    ensemble_raw_test_pred = apply_ensemble_weights(model_test_preds, ensemble_weighting)
     phase_timings["ensemble_sec"] = to_float(time.time() - phase_started_at)
+    log(
+        "[ensemble] "
+        f"simple_mae={ensemble_weighting['simple_average_mae']:.5f} "
+        f"weighted_mae={ensemble_weighting['mae']:.5f} "
+        f"elapsed={format_duration(phase_timings['ensemble_sec'])}"
+    )
 
     phase_started_at = time.time()
     log("[postprocess] evaluate OOF postprocessing candidates")
@@ -1952,8 +2127,9 @@ def main(cfg: DictConfig) -> None:
             "folds": fold_reports,
             "models": model_reports,
             "scores": score_summary,
-            "ensemble_type": "model_average",
+            "ensemble_type": ensemble_weighting["type"],
             "ensemble_members": list(model_oofs.keys()),
+            "ensemble_weighting": ensemble_weighting,
             "ensemble_raw_mae": to_float(mean_absolute_error(y, ensemble_raw_oof)),
             "ensemble_postprocessed_mae": to_float(mean_absolute_error(y, ensemble_post_oof)),
             "raw_negative_count": int((ensemble_raw_oof < 0).sum()),
